@@ -298,7 +298,7 @@ def selftest() -> int:
 
     # 假 key：只造对象，不发请求。这一步能抓出 import 路径写错、参数名不对这类问题。
     model = OpenAIChatCompletionClient(
-        model="deepseek-chat",
+        model="deepseek-flash",
         base_url="https://api.deepseek.com",
         api_key="sk-selftest-not-a-real-key",
         model_info={

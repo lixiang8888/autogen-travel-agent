@@ -6,9 +6,10 @@ llm.py —— 模型客户端：DeepSeek 走 OpenAI 兼容协议
 本项目用 AutoGen 自带的 OpenAIChatCompletionClient，不自己写 HTTP 客户端——
 群聊编排要的就是这个 client 对象本身。
 
-**第一个会撞上的坑**：AutoGen 不认识 `deepseek-chat` 这个模型名。不给它显式的
-能力声明，它会拒绝注册工具，而且报错信息不直白。所以下面 `model_info` 里那个
-`function_calling: True` 不能省——handoff 机制和 search/calculator 工具都靠它。
+**第一个会撞上的坑**：AutoGen 不认识 DeepSeek 的模型名。不给它显式的能力声明，
+它会拒绝注册工具，报错信息还不直白——`critic` 因为要挂 handoff，会直接抛
+「The model does not support function calling」。所以下面 `model_info` 里那个
+`function_calling: True` 不能省。
 
     取舍：`family` 只能填 "unknown"，意味着 AutoGen 会走保守路径，
     部分针对特定模型族的优化拿不到。可接受（BUILD.md 已知坑 1）。
@@ -27,12 +28,10 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
-#: 默认模型名。**BUILD.md 写的是 deepseek-chat，但姊妹项目 plan-solve-agent
-#: 实测 api.deepseek.com 只认 `deepseek-flash` 和 `deepseek-v4-pro`**（见那边的
-#: .env.example）。两种说法冲突，代码里没法定，所以做成可配的：
-#: 环境变量 / keys.py / .env 里设 DEEPSEEK_MODEL 即可覆盖，不用改代码。
-#: 阶段 1 若报 400 且提到 supported model names，就照报错里给的名字设一个。
-DEFAULT_MODEL = "deepseek-chat"
+#: 模型名。**BUILD.md 里写的 `deepseek-chat` 已实测为过期**——api.deepseek.com
+#: 认的是 `deepseek-flash` 和 `deepseek-v4-pro`（后者是推理模型，慢且贵）。
+#: 要换模型就设环境变量 / keys.py / .env 里的 DEEPSEEK_MODEL，不用动代码。
+DEFAULT_MODEL = "deepseek-flash"
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "").strip() or DEFAULT_MODEL
 
 ENV_DEEPSEEK = "DEEPSEEK_API_KEY"

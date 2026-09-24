@@ -25,14 +25,14 @@ TAVILY_API_KEY = "tvly-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 
 # ---------------------------------------------------------------------------
-# 可选：模型名（不填就用 llm.py 里的默认值 deepseek-chat）
+# 可选：模型名（不填就用 llm.py 里的默认值 deepseek-flash）
 # ---------------------------------------------------------------------------
 
-# ⚠️ 这条需要你实测确认。BUILD.md 写的是 `deepseek-chat`，但姊妹项目
-# plan-solve-agent 实测 api.deepseek.com **只认 `deepseek-flash` 和
-# `deepseek-v4-pro`**（见那边的 .env.example）。两种说法冲突。
+# api.deepseek.com 认两个模型名：
+#   deepseek-flash       默认，快而便宜 —— 本项目用这个
+#   deepseek-v4-pro      推理模型，更强但慢、贵
 #
-# 阶段 1 如果报 400 且消息里出现「supported API model names are ...」，
-# 就把下面这行打开、改成报错里给出的名字，不用动代码：
+# BUILD.md 里写的 `deepseek-chat` 已实测为过期，代码里没用它。
+# 要换模型时把这行打开改掉即可，不用动代码：
 #
-# DEEPSEEK_MODEL = "deepseek-flash"
+# DEEPSEEK_MODEL = "deepseek-v4-pro"
