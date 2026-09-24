@@ -19,6 +19,7 @@
 - [预期对话示意](#预期对话示意)
 - [已知坑与设计取舍](#已知坑与设计取舍)
 - [和 PS 框架的对照](#和-ps-框架的对照)
+- [已实测修正](#已实测修正)
 
 ---
 
@@ -62,14 +63,18 @@
 ```python
 from autogen_agentchat.agents import AssistantAgent, UserProxyAgent
 from autogen_agentchat.teams import RoundRobinGroupChat, SelectorGroupChat
-from autogen_agentchat.conditions import TextMentionTermination, MaxMessageTermination
+from autogen_agentchat.conditions import (
+    TextMentionTermination, MaxMessageTermination, HandoffTermination)
+from autogen_agentchat.messages import HandoffMessage
+from autogen_agentchat.base import Handoff
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 ```
 
 安装：
 
 ```bash
-pip install "autogen-agentchat==0.7.*" "autogen-ext[openai]==0.7.*"
+uv venv --python /usr/bin/python3.14     # 为什么不是 pip / 3.12，见文末修正 3
+uv pip install "autogen-agentchat==0.7.*" "autogen-ext[openai]==0.7.*" "requests>=2.31"
 ```
 
 注意 `autogen-core` / `autogen-agentchat` / `autogen-ext` 是三个包，
@@ -83,21 +88,27 @@ pip install "autogen-agentchat==0.7.*" "autogen-ext[openai]==0.7.*"
 
 ```
 autogen-travel-agent/
-├── BUILD.md          # 本文件
-├── llm.py            # 模型客户端：DeepSeek 走 OpenAI 兼容协议
-├── tools.py          # 工具：search（Tavily）
-├── persona.py        # 四个 agent 的定义：名字、system_message、挂哪些工具
-├── main.py           # 组队 + 跑：拓扑、终止条件、入口
-└── keys.py           # key，已在 .gitignore 里（照抄现有仓库的做法）
+├── BUILD.md           # 本文件（蓝图）
+├── docs/agents/       # 四份 agent 说明书：角色、边界、产出契约
+│   ├── researcher.md  planner.md  critic.md  user.md
+├── llm.py             # 模型客户端：DeepSeek 走 OpenAI 兼容协议
+├── tools.py           # 工具：search（Tavily）+ calculator
+├── persona.py         # 三个 LLM agent 的人格：角色 prompt + 格式契约
+├── main.py            # 组队 + 跑：拓扑、终止条件、5 个阶段的入口
+├── keys.py            # key，已在 .gitignore 里（照抄现有仓库的做法）
+├── keys.example.py    # keys.py 的模板，可提交
+├── pyproject.toml     # 依赖声明
+└── .gitignore
 ```
 
 | 文件 | 职责 | 什么时候要动它 |
 |---|---|---|
 | `llm.py` | 造 `OpenAIChatCompletionClient` 实例 | 换模型、换 key |
-| `tools.py` | 工具类 + 注册表 | 加工具、换搜索后端 |
-| `persona.py` | **四个 agent 的全部人格** | 改职责、改口吻、加减 agent |
+| `tools.py` | 工具函数 + 注册表 | 加工具、换搜索后端 |
+| `persona.py` | **三个 LLM agent 的全部人格** | 改职责、改口吻、加减 agent |
 | `main.py` | 把 agent 组成队、定终止条件 | 换拓扑、调轮数上限 |
-| `keys.py` | key | 只在换 key 时 |
+| `keys.py` / `keys.example.py` | key 与其模板 | 只在换 key 时 |
+| `docs/agents/*.md` | 每份的 §8 是 `persona.py` 里那两段 prompt 的出处 | 改人格前先改它 |
 
 **分层的意义**：`persona.py` 不认识 AutoGen 的 team，`main.py` 不认识
 system_message 的内容。改 agent 性格不用碰组队逻辑，换拓扑不用碰人格。
@@ -185,10 +196,16 @@ system_message 要点：
 
 ### user —— 你的入口
 
-`UserProxyAgent`，代表你本人。职责是提供初始需求和拍板。
+代表你本人。职责是提供初始需求和拍板。
 
-它不进「干活」的循环，只在 critic 提出问题、需要人做取舍时接话
+**它不进 `participants`，也不是一个 `UserProxyAgent` 实例**——只是
+`HandoffMessage` 里的一个字符串标签。critic 遇到需要人取舍的问题时触发 handoff，
+team 停下把控制权交回给你；你回复后 team 继续跑。
+
+它出现的时机只有两个：开局那一句 `task=`，以及中途被 critic 叫到时
 （「住宿预算砍一半」/「这个景点不去了」）。
+
+完整机制与踩过的坑见 [docs/agents/user.md](docs/agents/user.md) §2.1。
 
 ---
 
@@ -209,17 +226,23 @@ researcher 需要搜五六次没问题——AutoGen 的 agent 在**一轮之内*
 
 ```python
 termination = (
-    TextMentionTermination("APPROVED")   # critic 认可
-    | MaxMessageTermination(15)          # 兜底
+    TextMentionTermination("APPROVED")      # critic 认可，正常收工
+    | HandoffTermination(target="user")     # 需要人拍板，交回控制权
+    | MaxMessageTermination(15)             # 兜底保险丝
 )
 ```
 
-**双保险**，缺一不可。`TextMentionTermination` 依赖 critic 老实输出 APPROVED，
-而 LLM 不一定老实；`MaxMessageTermination` 是那根保险丝。
+**三重保险**。`TextMentionTermination` 依赖 critic 老实输出 APPROVED，而 LLM
+不一定老实；`HandoffTermination` 是主观取舍的出口（见[修正 2](#修正-2--user-不靠-userproxyagent-进队靠-handofftermination)）；
+`MaxMessageTermination` 是最后那根保险丝。
 
 配套地，critic 的 system_message 里必须写死
 「**只有**当所有问题都已解决，才输出 APPROVED」——
 否则它会在一堆问题没解决时就客气地说「基本没问题，APPROVED」。
+
+**`APPROVED` 必须裸着独占一行**：`TextMentionTermination` 按**子串**匹配，
+写成「尚未 APPROVED」会误触发终止。完整说明见
+[docs/agents/critic.md](docs/agents/critic.md) §8.3。
 
 **用 `|` 不要用 `&`**：`&` 要求两个条件同时满足，那要跑到 15 轮才停。
 
@@ -273,11 +296,19 @@ print(result.messages[-1].content)
 
 ### 阶段 5 · 终止条件与 user 回路
 
-加上 `TextMentionTermination | MaxMessageTermination`，
-把 `UserProxyAgent` 拉进队。
+加上 `TextMentionTermination | HandoffTermination | MaxMessageTermination`，
+并给 critic 声明 `handoffs=[Handoff(target="user")]`。
+
+**不要把 `UserProxyAgent` 拉进队**（原稿如此写，已实测推翻，见[修正 2](#修正-2--user-不靠-userproxyagent-进队靠-handofftermination)）。
+它的默认 `input_func` 读控制台，进队后 RoundRobin 每转到它就阻塞整个 team。
+改用 handoff 后 user 不进 `participants`，续跑时用 `HandoffMessage` 交回给 critic。
 
 **验证点**：连跑三次，每次都在合理轮数内自然结束（而不是撞到 15 轮上限）。
 撞上限说明 critic 不肯说 APPROVED，回去改它的 system_message。
+
+```bash
+.venv/bin/python main.py --stage 5
+```
 
 ---
 
@@ -285,15 +316,17 @@ print(result.messages[-1].content)
 
 | 想改什么 | 动哪个文件 | 怎么改 |
 |---|---|---|
-| 换模型 | `llm.py` | 换 `OpenAIChatCompletionClient` 的参数 |
-| 换某个 agent 的性格/职责 | `persona.py` | 改对应的 `system_message` 字符串 |
-| 加一个新 agent | `persona.py` + `main.py` | 定义 + 加进 `participants` |
-| 加一个新工具 | `tools.py` + `persona.py` | 写函数 + 挂到某个 agent 的 `tools=` |
+| 换模型名 | 环境变量 / `keys.py` / `.env` | 设 `DEEPSEEK_MODEL`，不用改代码 |
+| 换模型接入方式 | `llm.py` | 换 `OpenAIChatCompletionClient` 的参数 |
+| 换某个 agent 的性格/职责 | `docs/agents/*.md` §8 + `persona.py` | 两处一起改：说明书的两个代码块就是 `role_prompt` / `format_contract` |
+| 加一个新 agent | `persona.py` + `main.py` | 定一个 `AgentSpec` + 加进 `GROUP_MEMBERS` |
+| 加一个新工具 | `tools.py` + `persona.py` | 写函数 + 登记 `ALL_TOOLS` + 写进某个 `AgentSpec.tool_names` |
 | 换搜索后端 | `tools.py` | 重写 `search()` 的函数体，签名别动 |
 | 换群聊拓扑 | `main.py` | `RoundRobinGroupChat` → `SelectorGroupChat` |
 | 调轮数上限 | `main.py` | `MaxMessageTermination(n)` |
 | 改终止词 | `main.py` + `persona.py` | 两处要一起改，否则永不终止 |
-| 换 agent 说话顺序 | `main.py` | 改 `participants` 列表的顺序 |
+| 换 agent 说话顺序 | `main.py` | 改 `GROUP_MEMBERS` 的顺序 |
+| 改 user 接话方式 | `persona.py` + `main.py` | `handoffs=` 与 `HandoffTermination` 两处配套 |
 
 **最后两行是连体改动**，改一处忘一处会静默地退化成「跑到上限才停」。
 
@@ -348,12 +381,12 @@ print(result.messages[-1].content)
 
 ### 1. DeepSeek 接 AutoGen：必须显式声明模型能力
 
-**这是第一个会撞上的坑。** AutoGen 不认识 `deepseek-chat` 这个模型名，
-不给它能力声明，它会拒绝注册工具，报错信息还不直白。
+**这是第一个会撞上的坑。** AutoGen 不认识 DeepSeek 的模型名，不给它能力声明，
+它会拒绝注册工具，报错信息还不直白。
 
 ```python
 model = OpenAIChatCompletionClient(
-    model="deepseek-chat",
+    model="deepseek-flash",                    # ← 不是 deepseek-chat，见修正 1
     base_url="https://api.deepseek.com",
     api_key=os.environ["DEEPSEEK_API_KEY"],
     model_info={
@@ -365,6 +398,15 @@ model = OpenAIChatCompletionClient(
     },
 )
 ```
+
+**`function_calling: True` 比原以为的更硬。** 实测 `AssistantAgent.__init__` 里有
+这么一行：
+
+```python
+raise ValueError("The model does not support function calling, which is needed for handoffs.")
+```
+
+省掉它，`critic` 这个 agent 直接造不出来——因为它要挂 handoff 通道。
 
 **取舍**：`family` 只能填 `"unknown"`，意味着 AutoGen 会走保守路径，
 部分针对特定模型族的优化拿不到。可接受。
@@ -458,6 +500,68 @@ critic 只能比对「素材里有没有」，没法判断「素材本身对不�
 **但本项目刻意不做混合**，保持纯 AutoGen。理由：第一次学群聊编排，
 把两套东西拼在一起，出问题时你分不清是 AutoGen 用错了还是接缝处错了。
 混合方案留作下一个项目。
+
+---
+
+## 已实测修正
+
+本节记录本手册中**已被实际运行或查证推翻**的说法。上面的原文已就地改过，
+这里留一份集中的变更说明，方便回看「当初以为是什么、实际是什么」。
+新发现偏差就往这里加。
+
+### 修正 1 · 模型名是 `deepseek-flash`，不是 `deepseek-chat`
+
+- **原稿**：`model="deepseek-chat"`
+- **实测**：`api.deepseek.com` 只认 `deepseek-flash` 与 `deepseek-v4-pro`
+  （后者是推理模型，慢且贵）。`deepseek-chat` 会 400。
+- **已落地**：[llm.py](llm.py) 的 `DEFAULT_MODEL = "deepseek-flash"`，
+  可用 `DEEPSEEK_MODEL` 覆盖（环境变量 / `keys.py` / `.env` 三处任一）。
+
+### 修正 2 · user 不靠 `UserProxyAgent` 进队，靠 `HandoffTermination`
+
+- **原稿**：阶段 5「把 `UserProxyAgent` 拉进队」
+- **实测**：`UserProxyAgent` 的默认 `input_func` 读控制台。一旦它在
+  `participants` 里，RoundRobin 每转到它就**阻塞整个 team**，`run_stream`
+  遇到 `UserInputRequestedEvent` 不会终止，只是挂着等输入。官方文档明说这会让
+  team 处于**「不稳定状态，无法保存或恢复」**，只建议用于短的即时交互。
+- **改用**：`critic` 声明 `handoffs=[Handoff(target="user")]`，终止条件加
+  `HandoffTermination(target="user")`。user 不进 `participants`，只是
+  `HandoffMessage` 的 `source` 字符串。
+  **续跑必须用 `HandoffMessage`**——直接传字符串会报
+  `ValueError: The existing handoff target user is not one of the participants`。
+- **已落地**：[main.py](main.py) 的 `build_termination()` 与 `stage5_full()`；
+  完整说明见 [docs/agents/user.md](docs/agents/user.md) §2.1。
+
+### 修正 3 · 装依赖用 uv，Python 用系统的 3.14
+
+- **原稿**：`pip install "autogen-agentchat==0.7.*" ...`
+- **实测**：这台机器**没有 pip 模块**（`python3 -m pip` 报 No module named pip），
+  本地也没装任何 Python 3.12。而 `uv venv --python 3.12` 会去 GitHub 拉独立构建
+  ——GitHub 在此环境被墙，它会**静默卡死**（进程活着、stdout 为空、`.venv` 不出现）。
+  PyPI 直连正常，只有 GitHub 不通。
+- **改用**：
+
+  ```bash
+  uv venv --python /usr/bin/python3.14     # 显式给系统解释器，避开一切下载
+  uv pip install "autogen-agentchat==0.7.*" "autogen-ext[openai]==0.7.*" "requests>=2.31"
+  ```
+
+- **顺带确认**：`autogen-agentchat==0.7.5` 在 Python 3.14 上装得上也跑得通，
+  不需要为它降级 Python。`api.deepseek.com` 与 `api.tavily.com` 直连都通，
+  不用配代理。
+
+### 修正 4 · `TerminationCondition` 是 async 的
+
+- **原稿**：无（原稿没提）
+- **实测**：0.7.5 里 `reset()` 和 `__call__()` **都是协程**。同步调用会拿到一个
+  coroutine 对象——**它恒为真值**，会让「终止条件是否命中」的检查静默假通过。
+- **已落地**：[main.py](main.py) 的 `selftest()` 里用 `await`。team 内部自己
+  await，只有手写测试时要注意。
+
+### 修正 5 · 目录比原稿多了几个文件
+
+原稿的目录树只有 6 个文件。实际还多了：`docs/agents/`（四份说明书）、
+`keys.example.py`（`keys.py` 的模板，可提交）、`pyproject.toml`、`.gitignore`。
 
 ---
 
