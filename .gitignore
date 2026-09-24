@@ -1,0 +1,13 @@
+# 密钥 / 本地配置 —— 绝不提交
+keys.py
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 虚拟环境
+.venv/
+venv/
