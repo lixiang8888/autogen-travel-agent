@@ -26,7 +26,14 @@ from pathlib import Path
 from autogen_ext.models.openai import OpenAIChatCompletionClient
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-chat"
+
+#: 默认模型名。**BUILD.md 写的是 deepseek-chat，但姊妹项目 plan-solve-agent
+#: 实测 api.deepseek.com 只认 `deepseek-flash` 和 `deepseek-v4-pro`**（见那边的
+#: .env.example）。两种说法冲突，代码里没法定，所以做成可配的：
+#: 环境变量 / keys.py / .env 里设 DEEPSEEK_MODEL 即可覆盖，不用改代码。
+#: 阶段 1 若报 400 且提到 supported model names，就照报错里给的名字设一个。
+DEFAULT_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "").strip() or DEFAULT_MODEL
 
 ENV_DEEPSEEK = "DEEPSEEK_API_KEY"
 ENV_TAVILY = "TAVILY_API_KEY"
@@ -96,12 +103,15 @@ def build_model(api_key: str | None = None) -> OpenAIChatCompletionClient:
     if not key:
         raise RuntimeError(
             "没找到 DEEPSEEK_API_KEY。三种给法，任选一种：\n"
-            "  1. 填进 keys.py 的 DEEPSEEK_API_KEY\n"
+            "  1. cp keys.example.py keys.py，然后填进去\n"
             "  2. export DEEPSEEK_API_KEY=sk-...\n"
             "  3. 在项目根目录建 .env，写一行 DEEPSEEK_API_KEY=sk-..."
         )
+    # 模型名优先从配置里取，取不到才用模块级默认值
+    # ——这样改模型不用动代码，也方便在阶段 1 快速试哪个名字能通。
+    model_name = load_key("DEEPSEEK_MODEL") or DEEPSEEK_MODEL
     return OpenAIChatCompletionClient(
-        model=DEEPSEEK_MODEL,
+        model=model_name,
         base_url=DEEPSEEK_BASE_URL,
         api_key=key,
         model_info={
