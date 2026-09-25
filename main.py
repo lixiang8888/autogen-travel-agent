@@ -106,12 +106,38 @@ def build_team(model, specs, *, termination=None, max_turns: int | None = None):
 # ---------------------------------------------------------------------------
 
 def _print_message(message) -> None:
+    """打印一条消息。
+
+    content 可能是 str（TextMessage），也可能是**对象列表**——工具调用类事件
+    （ToolCallRequestEvent / ToolCallExecutionEvent）就是后者。早期版本直接
+    `.strip()`，一遇到工具调用就 AttributeError，阶段 3/4/5 全崩。
+    """
     source = getattr(message, "source", "?")
-    content = (getattr(message, "content", "") or "").strip()
-    if not content:
+    content = getattr(message, "content", "")
+
+    if isinstance(content, list):
+        lines: list[str] = []
+        for item in content:
+            name = getattr(item, "name", None) or type(item).__name__
+            args = getattr(item, "arguments", None)
+            result = getattr(item, "content", None)
+            if args is not None:                    # 模型发出的调用
+                lines.append(f"  → {name}({args})")
+            elif result is not None:                # 工具返回的结果
+                body = str(result).strip()
+                if len(body) > 400:
+                    body = f"{body[:400]}…（共 {len(body)} 字符）"
+                lines.append(f"  ← {name} 返回：{body}")
+            else:
+                lines.append(f"  · {name}")
+        text = "\n".join(lines)
+    else:
+        text = (content or "").strip()
+
+    if not text:
         return
     print(f"\n{_SEP}\n[{source}]\n{_SEP}")
-    print(content)
+    print(text)
 
 
 async def run_and_print(team, task) -> TaskResult:
@@ -139,10 +165,11 @@ def stopped_for_user(result: TaskResult) -> bool:
 
 
 def last_content(result: TaskResult) -> str:
+    """取最后一条**文本**消息。跳过 content 是列表的工具调用事件。"""
     for message in reversed(result.messages):
-        content = (getattr(message, "content", "") or "").strip()
-        if content:
-            return content
+        content = getattr(message, "content", "")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
     return ""
 
 
@@ -231,11 +258,15 @@ async def stage4_with_critic() -> None:
     await model.close()
 
 
-async def stage5_full(task: str) -> None:
+async def stage5_full(task: str, reply: str | None = None) -> None:
     """阶段 5 · 终止条件与 user 回路。
 
     验证点：连跑三次，每次都在合理轮数内自然结束（而不是撞到 15 轮上限）。
     撞上限说明 critic 不肯说 APPROVED，回去改它的 system_message。
+
+    Args:
+        reply: critic 请求拍板时的预设回答。传了就不读键盘——用于非交互跑
+            （脚本化、CI、或者让别的程序代跑）。不传则读一行标准输入。
     """
     model = build_model()
     team = build_team(model, (RESEARCHER, PLANNER, CRITIC), termination=build_termination())
@@ -246,14 +277,26 @@ async def stage5_full(task: str) -> None:
         handoffs += 1
         print(f"\n{_SEP}\n该你拍板了（第 {handoffs} 次）\n{_SEP}")
         print(last_content(result))
-        reply = input("\n你的决定（一句话，带一个数字或一个动作）> ").strip()
-        if not reply:
+
+        if reply is not None:
+            answer = reply.strip()
+            print(f"\n[--reply 预设的回答] {answer}")
+        else:
+            try:
+                answer = input("\n你的决定（一句话，带一个数字或一个动作）> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                # stdin 是空的（非交互跑）或用户按了 Ctrl-C/Ctrl-D。
+                # 这里不该糊一个 traceback——没输入就干净地停在当前进度。
+                print("\n（没有拿到输入，停在当前进度。）")
+                break
+
+        if not answer:
             print("（空输入，停止。）")
             break
         # 续跑必须用 HandoffMessage，交回给触发 handoff 的那个 agent
         target = getattr(result.messages[-1], "source", CRITIC.name)
         result = await run_and_print(
-            team, HandoffMessage(source="user", target=target, content=reply)
+            team, HandoffMessage(source="user", target=target, content=answer)
         )
 
     await model.close()
@@ -371,6 +414,33 @@ def selftest() -> int:
     except Exception as exc:                       # noqa: BLE001
         check("终止条件探测", False, f"{type(exc).__name__}: {exc}")
 
+    print("\n[7] 消息打印：工具调用事件（content 是列表）不能崩")
+    try:
+        import contextlib
+        import io
+
+        from autogen_agentchat.messages import ToolCallRequestEvent
+        from autogen_core import FunctionCall
+
+        event = ToolCallRequestEvent(
+            source="researcher",
+            content=[FunctionCall(id="c1", name="search", arguments='{"query":"成都"}')],
+        )
+        with contextlib.redirect_stdout(io.StringIO()):     # 自测本身别刷屏
+            _print_message(event)                            # 以前这里 AttributeError
+        check("_print_message 能吃列表 content", True)
+
+        class _FakeResult:                                   # last_content 只用 .messages
+            messages = [event]
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            got = last_content(_FakeResult())
+        check("last_content 会跳过工具事件", got == "", f"实际：{got!r}")
+    except AttributeError as exc:
+        check("消息打印处理列表 content", False, f"AttributeError: {exc}")
+    except Exception as exc:                                 # noqa: BLE001
+        check("消息打印处理列表 content", False, f"{type(exc).__name__}: {exc}")
+
     print("\n" + _SEP)
     if failures:
         print(f"离线自测失败 {len(failures)} 项：")
@@ -394,6 +464,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--selftest", action="store_true", help="离线自测，不需要 key")
     parser.add_argument("--stage", choices=["1", "2", "3", "4", "5", "all"], help="跑哪个阶段")
     parser.add_argument("--task", default=DEFAULT_TASK, help="初始需求，一句话")
+    parser.add_argument(
+        "--reply",
+        default=None,
+        help="阶段 5：critic 请求拍板时的预设回答。传了就不读键盘（用于非交互跑）",
+    )
     args = parser.parse_args(argv)
 
     if args.selftest:
@@ -404,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.stage in ("5", "all"):
-        runner = lambda: asyncio.run(stage5_full(args.task))   # noqa: E731
+        runner = lambda: asyncio.run(stage5_full(args.task, args.reply))   # noqa: E731
     else:
         stage_fn = {"1": stage1_connectivity, "2": stage2_researcher,
                     "3": stage3_two_agents, "4": stage4_with_critic}[args.stage]
