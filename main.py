@@ -479,6 +479,27 @@ def selftest() -> int:
     except Exception as exc:                                 # noqa: BLE001
         check("消息打印处理列表 content", False, f"{type(exc).__name__}: {exc}")
 
+    print("\n[8] 文档与 persona 同步：§8.1/§8.2 必须逐字等于 persona 里的字符串")
+    # 这条不变量已经被人为破坏过一次（改代码忘了改文档），所以用自测锁住：
+    # docs/agents/*.md 的 §8.1 / §8.2 两个代码块，按约定就是 persona.py 里
+    # role_prompt / format_contract 的原文，给读者看的解释一律写在代码块外面。
+    from pathlib import Path as _Path
+
+    for spec in (RESEARCHER, PLANNER, CRITIC):
+        doc_path = _Path(__file__).resolve().parent / "docs" / "agents" / f"{spec.name}.md"
+        if not doc_path.is_file():
+            check(f"{spec.name}.md 存在", False, "文件缺失")
+            continue
+        try:
+            doc = doc_path.read_text(encoding="utf-8")
+            s81 = doc.split("### 8.1 角色 prompt")[1].split("```")[1].strip()
+            s82 = doc.split("### 8.2 格式契约")[1].split("```")[1].strip()
+        except IndexError:
+            check(f"{spec.name}.md 有 §8.1/§8.2 代码块", False)
+            continue
+        check(f"{spec.name} §8.1 与 role_prompt 一致", s81 == spec.role_prompt.strip())
+        check(f"{spec.name} §8.2 与 format_contract 一致", s82 == spec.format_contract.strip())
+
     print("\n" + _SEP)
     if failures:
         print(f"离线自测失败 {len(failures)} 项：")
