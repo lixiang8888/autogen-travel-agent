@@ -563,6 +563,35 @@ critic 只能比对「素材里有没有」，没法判断「素材本身对不�
 原稿的目录树只有 6 个文件。实际还多了：`docs/agents/`（四份说明书）、
 `keys.example.py`（`keys.py` 的模板，可提交）、`pyproject.toml`、`.gitignore`。
 
+### 修正 6 · `max_tool_iterations` 默认 1，带工具的 agent 永远写不出结论
+
+**这是本项目最危险的一个坑——它让系统「看起来在跑」。**
+
+- **原稿**：无（原稿完全没提这两个参数）
+- **实测**：`AssistantAgent` 的 `max_tool_iterations` 默认是 **1**，
+  `reflect_on_tool_use` 默认解析为 **False**。两者叠加，**任何带工具的 agent 都写不出
+  自己的输出**。
+
+  `_process_model_result` 的循环是这样：模型第一轮若返回工具调用（`content` 不是
+  字符串），执行完工具后 `loop_iteration == max_tool_iterations - 1` 立刻成立并
+  `break`，随后**自动生成一个 `ToolCallSummaryMessage` 收尾**；默认又没有事后反思，
+  模型根本没机会看到工具返回了什么。
+
+- **表现**（每一条都极具迷惑性）：
+  - `critic` 调完 `calculator` 就没下文，永远不会说 `APPROVED` → 阶段 4/5 必然撞
+    15 轮上限
+  - `researcher` 的「素材清单」其实是**搜索结果原样拼接**，格式契约里那条
+    `【类别】内容 价格（来源：URL）` 从未被执行过
+  - **只有 `planner` 看着正常**——它没有工具，`content` 直接就是字符串
+- **后果最阴的地方**：planner 照抄那堆原始搜索结果，于是阶段 3 的「溯源率」检查
+  反而拿到 **100%**。是阶段 4 那句「critic 没输出结论」戳穿了整条链——这正好印证了
+  分阶段验证的价值：**只有带工具的 agent 会暴露它**。
+- **改用**：`build_agent()` 里显式设 `max_tool_iterations=5`、`reflect_on_tool_use=True`，
+  并加进离线自测锁死这两个值，防止日后被改回默认。
+- **修后实测**：`researcher` 从 1 轮搜索变 3 轮，输出变成逐条带来源的分段清单
+  （147 处 `（来源：）`）；`critic` 开始输出 `问题 N 条：` 并正确 handoff；推理内容
+  独立成 `ThoughtEvent`，不再混进正文。
+
 ---
 
 ## 参考
