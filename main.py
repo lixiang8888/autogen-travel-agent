@@ -41,13 +41,9 @@ import re
 import sys
 
 from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.base import Handoff, TaskResult
-from autogen_agentchat.conditions import (
-    HandoffTermination,
-    MaxMessageTermination,
-    TextMentionTermination,
-)
-from autogen_agentchat.messages import HandoffMessage, TextMessage
+from autogen_agentchat.base import Handoff, TaskResult, TerminatedException, TerminationCondition
+from autogen_agentchat.conditions import HandoffTermination, MaxMessageTermination
+from autogen_agentchat.messages import HandoffMessage, StopMessage, TextMessage
 from autogen_agentchat.teams import RoundRobinGroupChat
 
 from llm import build_model
@@ -90,12 +86,59 @@ _SEP = "=" * 72
 # 1. 造 agent 和 team
 # ---------------------------------------------------------------------------
 
+class ExactTextTermination(TerminationCondition):
+    """只在「某个 agent 发出的**一条消息恰好等于**该文本」时终止。
+
+    为什么不用 `TextMentionTermination("APPROVED")`：那个按**子串**匹配任意消息，
+    而实测 critic 会把思考写进消息正文（推理泄露）。只要那段思考里出现 APPROVED
+    这个子串——**哪怕是否定句**（「我还不能输出 APPROVED」）——整个对话就会提前
+    终止，把一份没审完的行程当通过交付出去。
+
+    实测见过 critic 的消息正文是这种形态：
+
+        All checks pass: 3730 ≤ 4000 … No time conflicts, no geographic detour.
+        Output APPROVED.
+
+    那次侥幸蒙对了（泄露的思考恰好也是通过），但方向反过来就是静默的错交付。
+
+    这条契约 docs/agents/critic.md §8.2 本来就写着（「该行必须只有 APPROVED 这八个
+    字符」），这里让代码去强制执行它，而不是指望模型自觉。见 BUILD.md 修正 7。
+    """
+
+    def __init__(self, text: str, source: str) -> None:
+        self._text = text
+        self._source = source
+        self._terminated = False
+
+    @property
+    def terminated(self) -> bool:
+        return self._terminated
+
+    async def __call__(self, messages) -> StopMessage | None:
+        if self._terminated:
+            raise TerminatedException("Termination condition has already been reached")
+        for message in messages:
+            if getattr(message, "source", None) != self._source:
+                continue
+            content = getattr(message, "content", "")
+            if isinstance(content, str) and content.strip() == self._text:
+                self._terminated = True
+                return StopMessage(
+                    content=f"'{self._text}' from {self._source} (exact match)",
+                    source="ExactTextTermination",
+                )
+        return None
+
+    async def reset(self) -> None:
+        self._terminated = False
+
+
 def build_termination():
     """三重终止条件。`|` 不要写成 `&`——`&` 要两个同时满足，会一直跑到上限。"""
     return (
-        TextMentionTermination("APPROVED")
-        | HandoffTermination(target="user")
-        | MaxMessageTermination(MAX_MESSAGES)
+        ExactTextTermination("APPROVED", source=CRITIC.name)   # critic 认可，须精确匹配
+        | HandoffTermination(target="user")                   # 需要人拍板，交回控制权
+        | MaxMessageTermination(MAX_MESSAGES)                 # 兜底保险丝
     )
 
 
@@ -430,9 +473,14 @@ def selftest() -> int:
         out: dict[str, object] = {}
         cases = [
             ("问题清单", TextMessage(source="critic", content="问题 2 条：\n1. 预算超支 570。")),
-            ("APPROVED", TextMessage(source="critic", content="APPROVED")),
+            ("裸APPROVED", TextMessage(source="critic", content="APPROVED")),
+            ("带空白", TextMessage(source="critic", content="  APPROVED\n")),
             ("handoff", HandoffMessage(source="critic", target="user", content="需要拍板")),
             ("附和话", TextMessage(source="critic", content="行程安排合理，考虑周到")),
+            # 下面三条是回归项：子串匹配会误触发，精确匹配不会
+            ("推理泄露", TextMessage(source="critic", content="All checks pass. Output APPROVED.")),
+            ("否定句", TextMessage(source="critic", content="我还不能输出 APPROVED，预算仍超支 672。")),
+            ("非critic", TextMessage(source="planner", content="APPROVED")),
         ]
         for label, msg in cases:
             await term.reset()
@@ -441,14 +489,11 @@ def selftest() -> int:
 
     try:
         probe = asyncio.run(_probe())
-        check("问题清单不触发终止", probe["问题清单"] is None, f"实际：{probe['问题清单']}")
-        check(
-            "APPROVED 触发终止",
-            probe["APPROVED"] is not None and "APPROVED" in str(probe["APPROVED"]),
-            f"实际：{probe['APPROVED']}",
-        )
+        for label in ("问题清单", "附和话", "推理泄露", "否定句", "非critic"):
+            check(f"{label} 不触发终止", probe[label] is None, f"实际：{probe[label]}")
+        for label in ("裸APPROVED", "带空白"):
+            check(f"{label} 触发终止", probe[label] is not None, f"实际：{probe[label]}")
         check("handoff 到 user 触发终止", probe["handoff"] is not None, f"实际：{probe['handoff']}")
-        check("无信息量的附和话不触发终止", probe["附和话"] is None, f"实际：{probe['附和话']}")
     except Exception as exc:                       # noqa: BLE001
         check("终止条件探测", False, f"{type(exc).__name__}: {exc}")
 

@@ -592,6 +592,31 @@ critic 只能比对「素材里有没有」，没法判断「素材本身对不�
   （147 处 `（来源：）`）；`critic` 开始输出 `问题 N 条：` 并正确 handoff；推理内容
   独立成 `ThoughtEvent`，不再混进正文。
 
+### 修正 7 · `TextMentionTermination("APPROVED")` 会被推理泄露误触发
+
+- **原稿**：`TextMentionTermination("APPROVED")`
+- **实测**：它按**子串**匹配任意消息。而实测 critic 会把思考写进消息正文（推理泄露），
+  于是只要那段思考里出现 `APPROVED`——**哪怕是否定句**——对话就提前终止。
+
+  实测见到的形态：
+
+  ```
+  All checks pass: 3730 ≤ 4000 … No time conflicts, no geographic detour.
+  Output APPROVED.
+  ```
+
+  那次侥幸蒙对（泄露的思考恰好也是「通过」）。方向反过来——「我还不能输出 APPROVED」
+  ——就是**静默的错交付**：一份没审完的行程被当成通过的交付给你。
+
+  这跟 [critic.md](docs/agents/critic.md) §8.3 反模式 1 是**同一类问题但来源不同**：
+  那条管的是「别把禁用词写进 prompt」，而这里的脏数据来自**模型自己**，所以那条对策
+  盖不住——必须靠代码兜。
+- **改用**：[main.py](main.py) 的 `ExactTextTermination`——只在「critic 发出的**一条
+  消息恰好等于** `APPROVED`」时终止。这等于让代码去强制执行 critic.md §8.2 本来就
+  写着的契约（「该行必须只有 APPROVED 这八个字符」），而不是指望模型自觉。
+- **回归**：离线自测第 [6] 节现在覆盖三种误触发（推理泄露、否定句、非 critic 来源）
+  与两种正触发（裸词、带空白）。
+
 ---
 
 ## 参考
