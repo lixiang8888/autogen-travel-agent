@@ -278,19 +278,21 @@ async def stage4_with_critic() -> None:
     await model.close()
 
 
-async def stage5_full(task: str, reply: str | None = None) -> None:
+async def stage5_full(task: str, replies: list[str] | None = None) -> None:
     """阶段 5 · 终止条件与 user 回路。
 
     验证点：连跑三次，每次都在合理轮数内自然结束（而不是撞到 15 轮上限）。
     撞上限说明 critic 不肯说 APPROVED，回去改它的 system_message。
 
     Args:
-        reply: critic 请求拍板时的预设回答。传了就不读键盘——用于非交互跑
-            （脚本化、CI、或者让别的程序代跑）。不传则读一行标准输入。
+        replies: 预设的拍板回答，第 N 次 handoff 用第 N 个。给完就停。
+            一个都不给则每次读一行标准输入。用于非交互跑（脚本化、CI、
+            或者「用不同的回答测收敛性」）。
     """
     model = build_model()
     team = build_team(model, (RESEARCHER, PLANNER, CRITIC), termination=build_termination())
 
+    queue = list(replies or [])
     result = await run_and_print(team, task)
     handoffs = 0
     while stopped_for_user(result) and handoffs < MAX_HANDOFFS:
@@ -298,9 +300,9 @@ async def stage5_full(task: str, reply: str | None = None) -> None:
         print(f"\n{_SEP}\n该你拍板了（第 {handoffs} 次）\n{_SEP}")
         print(last_content(result))
 
-        if reply is not None:
-            answer = reply.strip()
-            print(f"\n[--reply 预设的回答] {answer}")
+        if queue:
+            answer = queue.pop(0).strip()
+            print(f"\n[--reply 第 {handoffs} 个回答] {answer}")
         else:
             try:
                 answer = input("\n你的决定（一句话，带一个数字或一个动作）> ").strip()
@@ -495,8 +497,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--task", default=DEFAULT_TASK, help="初始需求，一句话")
     parser.add_argument(
         "--reply",
+        action="append",
         default=None,
-        help="阶段 5：critic 请求拍板时的预设回答。传了就不读键盘（用于非交互跑）",
+        metavar="回答",
+        help="阶段 5：拍板回答，可重复给多次（第 N 次 handoff 用第 N 个）。一个都不给则读键盘",
     )
     args = parser.parse_args(argv)
 
