@@ -243,6 +243,30 @@ def last_content(result: TaskResult) -> str:
     return ""
 
 
+def last_substantive_content(result: TaskResult) -> str:
+    """取触发 handoff **之前**那段正文——通常是 critic 的问题清单。
+
+    为什么要单独一个函数：`Handoff` 的工具是个**零参数**函数，源码就是
+
+        def _handoff_tool() -> str:
+            return self.message
+
+    ——它只原样返回 `Handoff(message=...)` 里那句固定的话。实测 critic 调
+    `transfer_to_user({})` 时参数确实是空的，所以它想问什么**只能在正文里写**。
+
+    实测它有时会跳过正文直接调工具（有一轮 6/6 次都没写），于是用户在终端只看到
+    「需要用户拍板」四个字，完全不知道要决定什么——人机回路等于白设。
+    这里往前翻，把那段正文捞出来给用户看。
+    """
+    for message in reversed(result.messages):
+        if isinstance(message, HandoffMessage):
+            continue                      # 跳过 handoff 本身，要的是它前面那段
+        content = getattr(message, "content", "")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # 3. 五个阶段（对应 BUILD.md §增量搭建路线）
 # ---------------------------------------------------------------------------
@@ -343,16 +367,24 @@ async def stage5_full(task: str, replies: list[str] | None = None) -> None:
     team = build_team(model, (RESEARCHER, PLANNER, CRITIC), termination=build_termination())
 
     queue = list(replies or [])
+    scripted = replies is not None      # 给了 --reply：用完就干净停下
     result = await run_and_print(team, task)
     handoffs = 0
     while stopped_for_user(result) and handoffs < MAX_HANDOFFS:
         handoffs += 1
         print(f"\n{_SEP}\n该你拍板了（第 {handoffs} 次）\n{_SEP}")
-        print(last_content(result))
+        # 取正文而不是 handoff 那句固定话（Handoff 工具是零参数的，见该函数注释）
+        print(last_substantive_content(result) or "（critic 没写出问题清单，只调了 handoff 工具）")
 
         if queue:
             answer = queue.pop(0).strip()
             print(f"\n[--reply 第 {handoffs} 个回答] {answer}")
+        elif scripted:
+            # 预设回答用完就停。**不要回退到 input()**——后台/管道场景下 stdin 可能是
+            # 「开着但不给数据」，input() 不抛 EOFError 而是永久阻塞，最后被 timeout
+            # 杀掉（实测撞过一次，白烧 30 分钟才看出来）。
+            print("\n（预设回答已用完，停在当前进度。）")
+            break
         else:
             try:
                 answer = input("\n你的决定（一句话，带一个数字或一个动作）> ").strip()
