@@ -59,6 +59,23 @@ MAX_MESSAGES = 15
 STAGE3_MAX_TURNS = 4          # 阶段 3/4 用硬停，先不设终止条件
 MAX_HANDOFFS = 3              # 最多问你三次，防止来回踢皮球
 
+#: 一轮里模型最多可以「调工具 → 看结果 → 再调」几次。
+#:
+#: **AutoGen 的默认值是 1，那是个会静默毁掉整个流程的坑。** 看
+#: AssistantAgent._process_model_result 的循环：只要模型第一轮返回的是工具调用
+#: （content 不是字符串），执行完工具后 `loop_iteration == max_tool_iterations - 1`
+#: 立刻成立并 break，然后**自动生成一个 ToolCallSummaryMessage 收尾**。
+#: 加上 reflect_on_tool_use 默认也是 False（没有事后反思），结果是：
+#:
+#:   - 模型永远看不到自己的工具返回了什么（搜索到的、算出来的）
+#:   - 于是永远写不出 persona 要求的格式化输出
+#:   - researcher 的「素材清单」变成搜索结果原样拼接
+#:   - critic 调完 calculator 就没下文了，永远不会说 APPROVED
+#:
+#: 只有 planner 看上去正常——因为它没有工具，content 直接就是字符串。
+#: 见 BUILD.md「已实测修正」第 6 条。
+MAX_TOOL_ITERATIONS = 5
+
 _SEP = "=" * 72
 
 
@@ -82,6 +99,9 @@ def build_agent(spec: AgentSpec, model) -> AssistantAgent:
         "system_message": build_system_message(spec),
         "model_client": model,
         "tools": build_tools(spec.tool_names),
+        # 下面两个默认值都必须显式改掉，理由见 MAX_TOOL_ITERATIONS 的注释
+        "max_tool_iterations": MAX_TOOL_ITERATIONS,
+        "reflect_on_tool_use": True,
     }
     if spec.handoffs:
         # Handoff 是通过模型生成工具调用来触发的，所以要求模型支持 function calling
@@ -378,6 +398,15 @@ def selftest() -> int:
     try:
         agents = [build_agent(spec, model) for spec in (RESEARCHER, PLANNER, CRITIC)]
         check("三个 agent 造得出来", len(agents) == 3)
+        # 这两个默认值不改的话，带工具的 agent 永远写不出结论（见 MAX_TOOL_ITERATIONS）
+        check(
+            "max_tool_iterations 已从默认 1 提高",
+            all(a._max_tool_iterations == MAX_TOOL_ITERATIONS for a in agents),
+        )
+        check(
+            "reflect_on_tool_use 已从默认 False 打开",
+            all(a._reflect_on_tool_use is True for a in agents),
+        )
         team = build_team(model, (RESEARCHER, PLANNER, CRITIC), termination=build_termination())
         check("team 造得出来", team is not None)
         check("user 不在 participants 里", "user" not in [a.name for a in team._participants])
