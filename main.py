@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 
 from autogen_agentchat.agents import AssistantAgent
@@ -175,12 +176,34 @@ async def stage2_researcher() -> None:
         task="帮我查一下成都大熊猫繁育研究基地的门票价格，以及成都市区地铁+打车的日均花费。"
     )
     await model.close()
+
     content = result.messages[-1].content or ""
+    print(f"\n{_SEP}\nresearcher 的完整输出\n{_SEP}\n{content}\n")
+
+    # 消息轨迹：能直接看出 search 有没有被真的调用
+    print(f"{_SEP}\n消息轨迹\n{_SEP}")
+    for msg in result.messages:
+        name = type(msg).__name__
+        src = getattr(msg, "source", "?")
+        extra = ""
+        calls = getattr(msg, "content", None)
+        if isinstance(calls, list):                     # 模型发出的 tool call
+            extra = "  工具调用: " + ", ".join(
+                str(getattr(c, "name", c)) for c in calls)
+        print(f"  {name:26} from {src}{extra}")
+
     print(f"\n{_SEP}\n阶段 2 验证点\n{_SEP}")
-    if "http" in content:
-        print("✓ 输出里含网址。请点开至少一个，确认内容对得上。")
+    if "搜索失败" in content or "未配置" in content:
+        print("✗ search 被调用了，但搜索本身失败——原因见上面的输出。")
+        print("  若提示认证失败，Tavily 的 key 是错的：正确的以 tvly- 开头。")
     else:
-        print("✗ 输出里没有网址——工具可能没调通，回查 tools.py 与 Tavily key。")
+        # 别拿 'http' 当判据——报错信息里也含 api.tavily.com，会假通过。
+        urls = [u for u in re.findall(r"https?://\S+", content)
+                if "api.tavily.com" not in u]
+        if urls:
+            print(f"✓ 输出里有 {len(urls)} 条外部网址。点开至少一个，确认内容对得上。")
+        else:
+            print("✗ 输出里没有外部网址——工具可能没调通，回查 tools.py 与 Tavily key。")
 
 
 async def stage3_two_agents() -> None:
