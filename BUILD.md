@@ -89,6 +89,7 @@ uv pip install "autogen-agentchat==0.7.*" "autogen-ext[openai]==0.7.*" "requests
 ```
 autogen-travel-agent/
 ├── BUILD.md           # 本文件（蓝图）
+├── README.md          # 定位、快速开始、结构一览
 ├── docs/agents/       # 四份 agent 说明书：角色、边界、产出契约
 │   ├── researcher.md  planner.md  critic.md  user.md
 ├── llm.py             # 模型客户端：DeepSeek 走 OpenAI 兼容协议
@@ -103,6 +104,7 @@ autogen-travel-agent/
 
 | 文件 | 职责 | 什么时候要动它 |
 |---|---|---|
+| `README.md` | 上手入口：定位、快速开始、结构一览 | 改安装方式、加开关时 |
 | `llm.py` | 造 `OpenAIChatCompletionClient` 实例 | 换模型、换 key |
 | `tools.py` | 工具函数 + 注册表 | 加工具、换搜索后端 |
 | `persona.py` | **三个 LLM agent 的全部人格** | 改职责、改口吻、加减 agent |
