@@ -1,6 +1,6 @@
 # user —— 需求方与拍板人
 
-> 本文是 [BUILD.md](../../BUILD.md) §四个 Agent 的展开：`user` 的角色、边界与产出契约。
+> 本文是 [README.md](../../README.md) 的展开：`user` 的角色、边界与产出契约。
 
 **体例说明**：`user` 是 `UserProxyAgent`，代表你本人，**不是 LLM agent**——它没有 `system_message`、没有工具、没有可调的 prompt。所以本文保留与另外三份相同的 8 个节名，但每节按**人机接口**重新定义。§8 不给代码块，给的是你自己该怎么说话。
 
@@ -25,7 +25,7 @@
 
 ### 2.1 接话靠 HandoffTermination，不是靠 UserProxyAgent
 
-⚠️ **BUILD.md 阶段 5 写的「把 `UserProxyAgent` 拉进队」不要照做。** 这是个实测过的坑：
+⚠️ **不要把 `UserProxyAgent` 拉进队。** 这是个实测过的坑：
 
 `UserProxyAgent` 的默认 `input_func` 读控制台。一旦它在 `participants` 里，`RoundRobin` 每转到它就会**阻塞整个 team**，`run_stream` 遇到 `UserInputRequestedEvent` 不会终止，只是挂着等你敲键盘。官方文档明说这会让 team 处于**「不稳定状态，无法保存或恢复」**，只建议用于「短的、即时的交互」——你不在电脑前就永久卡死，连断点续跑都做不了。
 
@@ -50,7 +50,7 @@ termination = (
 **两个附带结论**：
 
 - **`user` 不必是一个 AutoGen agent 实例。** handoff 方案里它只是 `HandoffMessage` 的 `source` 字符串，不需要 `UserProxyAgent`，也不需要 `input_func`。这是 `HandoffTermination` 相比「拉进队」最实在的好处。
-- **这套机制依赖 function calling。** handoff 是模型生成一次工具调用来触发的，所以 `critic` 的模型必须支持工具调用——BUILD.md 给 DeepSeek 显式打开 `function_calling: True`，正好是这个机制的前提（也是为什么那条不能省）。
+- **这套机制依赖 function calling。** handoff 是模型生成一次工具调用来触发的，所以 `critic` 的模型必须支持工具调用——`llm.py` 给 DeepSeek 显式打开 `function_calling: True`，正好是这个机制的前提（也是为什么那条不能省）。
 
 > 来源：[Human-in-the-Loop 教程](https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/human-in-the-loop.html) · [Issue #5599 阻塞状态](https://github.com/microsoft/autogen/issues/5599) · [Discussion #5623 续跑报错](https://github.com/microsoft/autogen/discussions/5623)
 
@@ -106,7 +106,7 @@ task = HandoffMessage(source="user", target="critic", content="预算砍到 4000
 user = UserProxyAgent(name="user")   # 不传 tools
 ```
 
-**为什么它不该有工具**：它一旦能联网或能算账，就变成了第四个干活的 agent，`researcher` 和 `critic` 的独有性同时被打破，拓扑失去意义（BUILD.md 的划界判据：工具集不同，或信息视野不同）。
+**为什么它不该有工具**：它一旦能联网或能算账，就变成了第四个干活的 agent，`researcher` 和 `critic` 的独有性同时被打破，拓扑失去意义（划界判据：工具集不同，或信息视野不同）。
 
 ## 7. 工作流程
 

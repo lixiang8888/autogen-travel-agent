@@ -8,29 +8,25 @@ main.py —— 组队 + 跑：拓扑、终止条件、入口
 
 **拓扑**：RoundRobinGroupChat，固定顺序 researcher → planner → critic → 循环。
 起步不用 SelectorGroupChat：先要可预测，再要聪明。等整个流程跑通了、知道「正常的
-对话长什么样」了，再换拓扑做对照实验（BUILD.md 已知坑 7）。
+对话长什么样」了，再换拓扑做对照实验（见 README「设计取舍」）。
 
 **终止条件**：三重，缺一不可。
-    TextMentionTermination("APPROVED")   critic 认可
-    HandoffTermination(target="user")    需要人拍板，交回控制权
-    MaxMessageTermination(15)            兜底保险丝——LLM 不一定老实
+    ExactTextTermination("APPROVED", "critic")  critic 认可（精确匹配，非子串）
+    HandoffTermination(target="user")           需要人拍板，交回控制权
+    MaxMessageTermination(15)                   兜底保险丝——LLM 不一定老实
 
-**user 不在 participants 里。** 这是本项目与 BUILD.md 阶段 5 的一处有意分歧：
-UserProxyAgent 的默认 input_func 读控制台，一旦进队，RoundRobin 每转到它就会阻塞
-整个 team，官方文档说这会让 team 变成「无法保存或恢复」的状态。改用
-HandoffTermination 后，user 只是 HandoffMessage 里的一个字符串标签。
+**user 不在 participants 里。** UserProxyAgent 的默认 input_func 读控制台，一旦进队，
+RoundRobin 每转到它就会阻塞整个 team，官方文档说这会让 team 变成「无法保存或恢复」
+的状态。改用 HandoffTermination 后，user 只是 HandoffMessage 里的一个字符串标签。
 详见 docs/agents/user.md §2.1。
 
 **续跑必须用 HandoffMessage**，不能直接传字符串——否则报
 `ValueError: The existing handoff target user is not one of the participants`。
 
 跑法：
+    python main.py "一句话需求"    # 完整流程（不传需求用内置示例）
     python main.py --selftest     # 离线自测，不需要 key、不联网
-    python main.py --stage 1      # 阶段 1：DeepSeek 连通性
-    python main.py --stage 2      # 阶段 2：单 agent 带 search 跑通
-    python main.py --stage 3      # 阶段 3：两个 agent 进群聊
-    python main.py --stage 4      # 阶段 4：加 critic
-    python main.py --stage 5      # 阶段 5：终止条件 + user 回路
+    python main.py --stage 1..4   # 调试用：逐层排查是哪一层坏的，见 README
 """
 
 from __future__ import annotations
@@ -76,7 +72,7 @@ MAX_HANDOFFS = 6
 #:   - critic 调完 calculator 就没下文了，永远不会说 APPROVED
 #:
 #: 只有 planner 看上去正常——因为它没有工具，content 直接就是字符串。
-#: 见 BUILD.md「已实测修正」第 6 条。
+#: 见 README「实测踩过的坑」第 2 条。
 MAX_TOOL_ITERATIONS = 5
 
 _SEP = "=" * 72
@@ -102,7 +98,7 @@ class ExactTextTermination(TerminationCondition):
     那次侥幸蒙对了（泄露的思考恰好也是通过），但方向反过来就是静默的错交付。
 
     这条契约 docs/agents/critic.md §8.2 本来就写着（「该行必须只有 APPROVED 这八个
-    字符」），这里让代码去强制执行它，而不是指望模型自觉。见 BUILD.md 修正 7。
+    字符」），这里让代码去强制执行它，而不是指望模型自觉。见 README「实测踩过的坑」第 3 条。
     """
 
     def __init__(self, text: str, source: str) -> None:
@@ -268,7 +264,7 @@ def last_substantive_content(result: TaskResult) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3. 五个阶段（对应 BUILD.md §增量搭建路线）
+# 3. 五个阶段（调试用：逐层排查是哪一层坏的，日常不传 --stage）
 # ---------------------------------------------------------------------------
 
 async def stage1_connectivity() -> None:
@@ -441,7 +437,7 @@ def selftest() -> int:
         got = calculator(bad)
         check(f"拒绝 {bad[:28]!r}", got.startswith("计算失败"), f"实际：{got}")
 
-    print("\n[3] 工具：挂载关系与 BUILD.md 的表格一致")
+    print("\n[3] 工具：挂载关系与 README「谁有什么工具」表一致")
     check("researcher 只挂 search", RESEARCHER.tool_names == ("search",))
     check("planner 一把都不挂", PLANNER.tool_names == ())
     check("critic 只挂 calculator", CRITIC.tool_names == ("calculator",))
@@ -583,7 +579,7 @@ def selftest() -> int:
         for item in failures:
             print(f"  - {item}")
         return 1
-    print("离线自测全部通过。接线没问题，可以填 key 跑 --stage 1 了。")
+    print("离线自测全部通过。接线没问题，可以填 key 跑 `python main.py \"需求\"` 了。")
     return 0
 
 
@@ -595,32 +591,50 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="AutoGen 多智能体旅行规划器",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="阶段编号对应 BUILD.md §增量搭建路线（5 阶段）。",
+        epilog=(
+            "例子：\n"
+            '  python main.py "我国庆去诸暨玩，三天，两个人，预算 2000。"\n'
+            "  python main.py --selftest\n"
+            "\n"
+            "不传需求就用内置示例任务。跑起来后 critic 会停下来问你拍板——"
+            "回答时带一个具体的数字或动作，「住宿砍到 250 一晚」比「再优化一下」有用。"
+        ),
     )
-    parser.add_argument("--selftest", action="store_true", help="离线自测，不需要 key")
-    parser.add_argument("--stage", choices=["1", "2", "3", "4", "5", "all"], help="跑哪个阶段")
-    parser.add_argument("--task", default=DEFAULT_TASK, help="初始需求，一句话")
+    # 需求用**位置参数**：日常用法的全部就是 `python main.py "一句话需求"`。
+    parser.add_argument("task", nargs="?", default=None, help="旅行需求，一句话（不传用内置示例）")
+    parser.add_argument("--selftest", action="store_true", help="离线自测，不需要 key、不联网")
+    parser.add_argument(
+        "--task", dest="task_opt", default=None, metavar="需求",
+        help="同上，位置参数的别名（早期文档里用的写法）",
+    )
     parser.add_argument(
         "--reply",
         action="append",
         default=None,
         metavar="回答",
-        help="阶段 5：拍板回答，可重复给多次（第 N 次 handoff 用第 N 个）。一个都不给则读键盘",
+        help="拍板回答，可重复给多次（第 N 次问你用第 N 个）。一个都不给则读键盘",
+    )
+    # 调试选项：日常不用。出问题时按 1→2→3→4 往回退，能定位是哪一层坏的。
+    parser.add_argument(
+        "--stage", choices=["1", "2", "3", "4", "5", "all"], help=argparse.SUPPRESS
     )
     args = parser.parse_args(argv)
 
     if args.selftest:
         return selftest()
 
-    if not args.stage:
-        parser.print_help()
-        return 0
+    if args.task and args.task_opt:
+        print("\n需求用位置参数给一次就行，不要同时写 --task。\n", file=sys.stderr)
+        return 2
+    task = args.task or args.task_opt or DEFAULT_TASK
 
-    if args.stage in ("5", "all"):
-        runner = lambda: asyncio.run(stage5_full(args.task, args.reply))   # noqa: E731
+    # 不传 --stage 就是完整流程（含人机回路）。--stage 只用于逐层排查。
+    stage = args.stage or "5"
+    if stage in ("5", "all"):
+        runner = lambda: asyncio.run(stage5_full(task, args.reply))   # noqa: E731
     else:
         stage_fn = {"1": stage1_connectivity, "2": stage2_researcher,
-                    "3": stage3_two_agents, "4": stage4_with_critic}[args.stage]
+                    "3": stage3_two_agents, "4": stage4_with_critic}[stage]
         runner = lambda: asyncio.run(stage_fn())               # noqa: E731
 
     try:

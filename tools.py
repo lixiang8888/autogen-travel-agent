@@ -3,7 +3,7 @@
 tools.py —— 工具：search（Tavily）+ calculator
 ================================================
 
-**只有两个工具，且各只挂给一个 agent**（BUILD.md §四个 Agent 的划界判据）：
+**只有两个工具，且各只挂给一个 agent**（划界判据：工具集不同，或信息视野不同）：
 
     search      → researcher，全队唯一联网者
     calculator  → critic，全队唯一算账者

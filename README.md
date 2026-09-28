@@ -22,16 +22,12 @@
 2. **改人格不用碰编排。** `persona.py` 不认识 AutoGen 的 team，`main.py` 不认识
    `system_message` 的内容。
 
-想动手改东西看 **[BUILD.md](BUILD.md)**（搭建蓝图：目录职责、5 阶段搭建路线、
-「想改 X 就动 Y」、已知坑与**已实测修正**）。想知道每个 agent 为什么长这样，看
-**[docs/agents/](docs/agents/)**。
-
 ### 快速开始
 
 依赖：**Python ≥ 3.12**（实测 3.14.4 可用）+ `autogen-agentchat` 0.7.5。
 
 ```bash
-uv venv --python /usr/bin/python3.14     # 显式给系统解释器，理由见「已知的坑」
+uv venv --python /usr/bin/python3.14     # 显式给系统解释器，理由见「实测踩过的坑」
 uv pip install "autogen-agentchat==0.7.*" "autogen-ext[openai]==0.7.*" "requests>=2.31"
 ```
 
@@ -44,13 +40,15 @@ cp keys.example.py keys.py    # 然后填进 DEEPSEEK_API_KEY 与 TAVILY_API_KEY
 跑起来：
 
 ```bash
-.venv/bin/python main.py --selftest    # 离线自测：不用 key、不联网
-.venv/bin/python main.py --stage 1     # 阶段 1：DeepSeek 连通性
-.venv/bin/python main.py --stage 5     # 阶段 5：完整流程（会停下来问你拍板）
+python main.py "我国庆去诸暨玩，三天，两个人，预算 2000。"   # 直接跑完整流程
+python main.py --selftest                                  # 离线自测：不用 key、不联网
 ```
 
-`--stage 1..5` 对应 BUILD.md 的增量搭建路线，每一步的验证点写在输出里。
-`--reply "..."` 可**重复给多次**（第 N 次拍板用第 N 个回答），用于非交互跑。
+不传需求就用内置的示例任务（成都三天两晚 4000 元）。
+
+跑起来后：约两分钟终端不动是正常的（researcher 在联网查，一轮要搜七八次）；然后它
+**停下来问你**，打出 critic 的问题清单——你敲一句话回答，带具体数字或动作
+（「住宿砍到 250 一晚」比「再优化一下」有用），它继续跑；critic 说 `APPROVED` 就结束。
 
 > 安全：`keys.py` 已在 [.gitignore](.gitignore) 中忽略、不会进 git。若曾把真实 key
 > 填进文件并外传过，请到 DeepSeek / Tavily 控制台轮换重置。
@@ -82,7 +80,7 @@ cp keys.example.py keys.py    # 然后填进 DEEPSEEK_API_KEY 与 TAVILY_API_KEY
 
 第一条为什么不用 `TextMentionTermination`：那个按**子串**匹配任意消息，而 critic 会把
 思考写进消息正文，只要那段思考里出现 `APPROVED`（**哪怕是否定句**「我还不能输出
-APPROVED」）就会提前终止，把没审完的行程当通过交付。详见 BUILD.md 已实测修正 7。
+APPROVED」）就会提前终止，把没审完的行程当通过交付。见「实测踩过的坑」第 3 条。
 
 `user` **不进 `participants`**——它是 `HandoffMessage` 里的一个字符串标签，不是一个
 `UserProxyAgent` 实例。理由是后者默认读控制台，会阻塞整个 team 且官方文档说无法保存
@@ -91,12 +89,12 @@ APPROVED」）就会提前终止，把没审完的行程当通过交付。详见
 ### 结构一览
 
 ```
-BUILD.md             搭建蓝图（先读这个）
+README.md            本文件：定位、用法、改哪里、踩过的坑
 docs/agents/         四个 agent 的说明书：角色、边界、产出契约
 llm.py               DeepSeek 客户端（AutoGen 的 OpenAIChatCompletionClient）
 tools.py             search(Tavily) + calculator + 注册表
 persona.py           三个 LLM agent 的人格（角色 prompt + 格式契约）
-main.py              组队、终止条件、5 个阶段入口、离线自测
+main.py              组队、终止条件、入口、离线自测
 keys.py              key（不进 git）
 keys.example.py      keys.py 的模板
 ```
@@ -115,21 +113,86 @@ system_message = 角色 prompt + "\n\n" + 格式契约
 整块搬走。注意 `docs/agents/*.md` 的 §8.1/§8.2 就是这两段的**原文**，改一处必须改
 另一处——离线自测第 [8] 节会核对，脱钩就跑不过。
 
-### 已知的坑
+### 想改 X，就动 Y
 
-完整的七条在 BUILD.md「已实测修正」。刚上手最容易撞的两个：
+| 想改什么 | 动哪个文件 | 怎么改 |
+| --- | --- | --- |
+| 换模型名 | 环境变量 / `keys.py` / `.env` | 设 `DEEPSEEK_MODEL`，不用改代码 |
+| 换模型接入方式 | `llm.py` | 换 `OpenAIChatCompletionClient` 的参数 |
+| 换某个 agent 的性格、职责 | `docs/agents/*.md` §8 + `persona.py` | 两处一起改：说明书的两个代码块就是 `role_prompt` / `format_contract` |
+| 加一个新 agent | `persona.py` + `main.py` | 定一个 `AgentSpec` + 加进 `GROUP_MEMBERS` |
+| 加一个新工具 | `tools.py` + `persona.py` | 写函数 + 登记 `ALL_TOOLS` + 写进某个 `AgentSpec.tool_names` |
+| 换搜索后端 | `tools.py` | 重写 `search()` 的函数体，签名别动 |
+| 换群聊拓扑 | `main.py` | `RoundRobinGroupChat` → `SelectorGroupChat` |
+| 调轮数上限 | `main.py` | `MaxMessageTermination(n)` |
+| 调最多问几次拍板 | `main.py` | `MAX_HANDOFFS` |
+| 改终止词 | `main.py` + `persona.py` | 两处要一起改，否则永不终止 |
+| 换 agent 说话顺序 | `main.py` | 改 `GROUP_MEMBERS` 的顺序 |
+| 改 user 接话方式 | `persona.py` + `main.py` | `handoffs=` 与 `HandoffTermination` 两处配套 |
 
-- **装依赖别用 `uv venv --python 3.12`**。它会去 GitHub 拉独立构建，而 GitHub 在
-  某些网络环境下不通，表现为**静默卡死**（进程活着、stdout 为空、`.venv` 不出现）。
-  显式给系统解释器路径即可绕开。
-- **模型名是 `deepseek-flash`，不是 `deepseek-chat`**。后者已过期会 400。
-  要换就设环境变量 `DEEPSEEK_MODEL`，不用改代码。
+最后三行是**连体改动**，改一处忘一处会静默退化成「跑到上限才停」。
+
+### 调试：逐阶段跑
+
+`--stage` 是调试选项，日常不用（不传参数就是完整流程）。**出问题时就按这个顺序往回退**，
+每一步的验证点写在输出里：
+
+| 命令 | 验什么 |
+| --- | --- |
+| `--stage 1` | DeepSeek 连不连得上（应无 `model_info` 报错） |
+| `--stage 2` | 只跑 researcher，输出里有没有**真实可点的网址**——点开一个确认内容对得上 |
+| `--stage 3` | researcher + planner，planner 有没有引用查到的**具体票价**而非自己编 |
+| `--stage 4` | 加 critic，它有没有挑出**真问题**（只会说「行程很合理」就是失败） |
+
+非交互地跑（脚本化、测试用）：`--reply "回答"` 可重复给多次，第 N 次拍板用第 N 个。
+
+### 实测踩过的坑
+
+都已修，记录在此避免重蹈。每条都有对应代码/注释。
+
+1. **模型名是 `deepseek-flash`，不是 `deepseek-chat`。** 后者已过期会 400。
+   要换设 `DEEPSEEK_MODEL`，不用改代码。
+2. **`max_tool_iterations` 默认 1，带工具的 agent 永远写不出结论。** AutoGen 执行完
+   工具后立刻自动生成 `ToolCallSummaryMessage` 收尾，模型看不到工具返回了什么。表现
+   极具迷惑性：critic 调完计算器就没下文（永不说 `APPROVED`），researcher 的「素材
+   清单」其实是搜索结果原样拼接。**只有 planner 看着正常**（它没工具）。已显式设为 5。
+3. **`TextMentionTermination` 会被推理泄露误触发。** critic 会把思考写进消息正文，
+   只要思考里含 `APPROVED`（哪怕是否定句）就提前终止。已改成 `ExactTextTermination`
+   精确匹配。
+4. **`user` 不靠 `UserProxyAgent` 进队。** 它默认读控制台，进队后 RoundRobin 每转到
+   它就阻塞整个 team，官方文档说这会让 team 无法保存恢复。改用 `HandoffTermination`。
+5. **handoff 工具是零参数的。** 源码就是 `def _handoff_tool() -> str: return self.message`
+   ——critic 想问什么**只能写在正文里**。实测它会跳过正文直接调工具，于是用户只看到
+   「需要用户拍板」四个字。已在人格里写死「先写问题清单再调工具」，并在 `main.py`
+   里往前翻出那段正文给用户看。
+6. **`TerminationCondition` 是 async 的。** `reset()` 和 `__call__()` 都是协程；同步
+   调用会拿到 coroutine 对象——**它恒为真值**，会让检查静默假通过。
+7. **装依赖别用 `uv venv --python 3.12`。** 它会去 GitHub 拉独立构建，而 GitHub 在某
+   些网络环境下不通，表现为**静默卡死**（进程活着、stdout 为空、`.venv` 不出现）。
+   显式给系统解释器路径即可绕开。PyPI 直连通常正常。
+8. **`--reply` 用完会挂死。** 早期实现用完回退到 `input()`，而管道场景下 stdin 可能是
+   「开着但不给数据」——不抛 `EOFError` 而是永久阻塞，最后被 timeout 杀掉。已改为用完即停。
+
+### 设计取舍
+
+有意为之，不是 bug。改之前先想清楚代价。
+
+- **工具挂载不对称**：见「谁有什么工具」。这是拓扑的地基，不是权限设置。
+- **critic 只能比对「素材里有没有」，不能判断「素材本身对不对」。** researcher 搜回一个
+  错价，critic 会当成真的。这是**能力边界**，所以每条素材必须带来源链接——最终把关的
+  是你点开链接那一刻。
+- **RoundRobin 的僵硬**：固定顺序意味着 critic 挑出问题后，下一个说话的按顺序轮转。
+  「先要可预测，再要聪明」——没有基准就没法判断换拓扑是变好了还是变差了。
+- **上下文会膨胀**：群聊里每条消息都累加进后续每个 agent 的上下文，几轮下来 token 涨得
+  很快。**现阶段接受，不做优化**——过早优化会让「跑不对」和「省 token」两个问题缠在
+  一起，没法 debug。
+- **成本比 PS 框架高一个量级**：一次完整对话十几轮 LLM 调用。多智能体的固有代价，它买
+  的是「对抗性」（critic 能推翻 planner）。
 
 ### 文档
 
 | 文件 | 内容 |
 | --- | --- |
-| 本文件 | 定位、快速开始、工具挂载、终止条件、结构一览 |
-| [BUILD.md](BUILD.md) | 搭建蓝图：5 阶段路线、想改 X 就动 Y、已知坑与已实测修正 |
+| 本文件 | 定位、用法、改哪里、踩过的坑、设计取舍 |
 | [docs/agents/](docs/agents/) | 四个 agent 的说明书（角色 / 能力 / 职责 / 工具 / 流程 / 输出格式） |
 | [keys.example.py](keys.example.py) | key 模板与申请地址 |

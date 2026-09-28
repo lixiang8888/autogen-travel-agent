@@ -12,7 +12,7 @@ llm.py —— 模型客户端：DeepSeek 走 OpenAI 兼容协议
 `function_calling: True` 不能省。
 
     取舍：`family` 只能填 "unknown"，意味着 AutoGen 会走保守路径，
-    部分针对特定模型族的优化拿不到。可接受（BUILD.md 已知坑 1）。
+    部分针对特定模型族的优化拿不到。可接受。
 
 用法：
     from llm import build_model
@@ -28,7 +28,7 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 
-#: 模型名。**BUILD.md 里写的 `deepseek-chat` 已实测为过期**——api.deepseek.com
+#: 模型名。**老文档里写的 `deepseek-chat` 已实测为过期**——api.deepseek.com
 #: 认的是 `deepseek-flash` 和 `deepseek-v4-pro`（后者是推理模型，慢且贵）。
 #: 要换模型就设环境变量 / keys.py / .env 里的 DEEPSEEK_MODEL，不用动代码。
 DEFAULT_MODEL = "deepseek-flash"
@@ -115,7 +115,7 @@ def build_model(api_key: str | None = None) -> OpenAIChatCompletionClient:
         api_key=key,
         model_info={
             "vision": False,
-            "function_calling": True,     # ← 不写这个，工具挂不上（BUILD.md 已知坑 1）
+            "function_calling": True,     # ← 不写这个工具挂不上；critic 挂了 handoff，省了它直接造不出来
             "json_output": True,
             "family": "unknown",
             "structured_output": False,

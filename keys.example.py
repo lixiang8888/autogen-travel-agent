@@ -32,7 +32,7 @@ TAVILY_API_KEY = "tvly-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 #   deepseek-flash       默认，快而便宜 —— 本项目用这个
 #   deepseek-v4-pro      推理模型，更强但慢、贵
 #
-# BUILD.md 里写的 `deepseek-chat` 已实测为过期，代码里没用它。
+# 老文档里写的 `deepseek-chat` 已实测为过期，代码里没用它。
 # 要换模型时把这行打开改掉即可，不用动代码：
 #
 # DEEPSEEK_MODEL = "deepseek-v4-pro"
