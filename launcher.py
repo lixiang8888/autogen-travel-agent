@@ -4,8 +4,21 @@ launcher.py —— 网页启动器：把终端里的多智能体旅行规划搬�
 ==================================================================
 
 跑法：
-    python launcher.py            # 起服务，然后开它打印的那个 URL
+    python launcher.py            # 起服务，并自动打开浏览器
     python launcher.py --demo     # 离线假数据：不需要 key、不联网、不烧 token
+
+**日常用法是双击桌面快捷方式**，不用敲命令。快捷方式的目标是
+
+    wsl.exe -d Ubuntu --cd <项目目录> -- .venv/bin/python launcher.py
+
+也就是「起服务 + 开浏览器」两件事一次做完。
+
+两件为「双击」做的事：
+1. `_open_browser()` 走 WSL 互操作调 Windows 的 explorer.exe——WSL 里 webbrowser
+   模块找的是 Linux 侧的浏览器，基本没装，指望不上。
+2. `_existing_instance()` + `/health`：**重复双击不会起第二个服务**，只会把浏览器
+   指到已经在跑的那个。少了这一步，第二次双击会顺延到 8766，于是你有两个各自
+   为政的页面，而且新那个啥历史都没有。
 
 **零新增依赖**，只用标准库。之所以不做独立窗口（Tk）而做网页：中文排版和换行
 交给浏览器，比 Tk 8.6 省心一个量级；而且不用给 venv 装 tkinter。
@@ -43,8 +56,12 @@ import argparse
 import asyncio
 import json
 import queue
+import shutil
+import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -55,6 +72,50 @@ from main import ASK_HINT, DEFAULT_TASK, RunHooks, format_message, stage5_full
 #: 哨兵：区分「用户点了停止」和「用户提交了空串」。
 #: 后者要触发 main.py 里「（空输入，停止。）」那条分支，不能混为一谈。
 _STOP = object()
+
+#: /health 里报的身份。启动时用它认「这个端口上是不是已经有一个我了」——
+#: 双击图标两次是很常见的动作，不该因此起了两个服务、开出两个各自为政的页面。
+_APP_ID = "autogen-travel-agent-launcher"
+
+
+def _existing_instance(port: int) -> bool:
+    """这个端口上已经有一个我们自己起的启动器吗？
+
+    认的是 /health 里的 _APP_ID，而不是「端口通不通」——不然会把别人占用的
+    端口误判成自己人，然后把浏览器指到一个不相干的页面上。
+    """
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.6) as resp:
+            return json.loads(resp.read()).get("app") == _APP_ID
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+        return False
+
+
+def _open_browser(url: str) -> None:
+    """尽力在**用户的**浏览器里打开这个 URL。
+
+    WSL 里 `webbrowser` 模块基本指望不上——它找的是 Linux 侧的图形浏览器，多半
+    没装。真正管用的是走 WSL 互操作去调 Windows 的 `explorer.exe`：它拿 URL 当
+    参数时会用 Windows 的**默认浏览器**打开。所以顺序是 Windows 优先、webbrowser 兜底。
+    """
+    for argv in (["explorer.exe", url], ["cmd.exe", "/c", "start", "", url]):
+        exe = shutil.which(argv[0])
+        if not exe:
+            continue
+        try:
+            # explorer.exe 成功时也常常返回非 0，所以不 check；超时兜住卡死的情况。
+            subprocess.run(
+                [exe, *argv[1:]],
+                check=False, timeout=10,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return
+        except (OSError, subprocess.SubprocessError):
+            continue
+    try:
+        webbrowser.open(url)
+    except Exception:                                    # noqa: BLE001
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +405,10 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(page)))
             self.end_headers()
             self.wfile.write(page)
+        elif path == "/health":
+            # 只报身份，不碰 session——所以跑着一轮的时候它照样秒回，
+            # 这正是「重复双击能不能认出自己人」需要的性质。
+            self._json({"app": _APP_ID, "demo": self.server.demo})
         elif path == "/events":
             self._stream()
         elif path == "/favicon.ico":
@@ -665,6 +730,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-browser", action="store_true", help="不要试着自动开浏览器")
     args = parser.parse_args(argv)
 
+    # 已经有一个在跑？把浏览器指过去就完事，**不要再起第二个**。
+    # 双击图标两次、或者服务在后台开着又点了一次，都会走到这里；不起这一步的话
+    # 第二个实例会顺延到下一个端口，于是你得到两个各自为政的页面。
+    for port in range(args.port, args.port + 11):
+        if _existing_instance(port):
+            url = f"http://localhost:{port}/"
+            print(f"启动器已经在跑了，直接把浏览器指过去：\n\n    {url}\n", flush=True)
+            if not args.no_browser:
+                _open_browser(url)
+            return 0
+
     server = None
     for port in range(args.port, args.port + 11):
         try:
@@ -680,21 +756,17 @@ def main(argv: list[str] | None = None) -> int:
     url = f"http://localhost:{port}/"
     # flush 是必须的：stdout 不是 TTY 时（`| tee`、后台跑）Python 会块缓冲，
     # 不 flush 的话这段话会一直卡在缓冲区里，用户看不到 URL 就只能干等。
-    print(f"\n{'=' * 72}\n旅行规划启动器已就绪，在浏览器里打开：\n\n    {url}\n", flush=True)
+    print(f"\n{'=' * 72}\n旅行规划启动器已就绪：\n\n    {url}\n", flush=True)
+    print("正在打开浏览器……没反应就手动复制上面这个地址。" if not args.no_browser
+          else "（--no-browser：不自动开浏览器，手动复制上面这个地址。）", flush=True)
     if args.demo:
         print("（--demo：离线假数据，不需要 key、不联网。）", flush=True)
-    print(f"{'=' * 72}\n按 Ctrl-C 停止服务。", flush=True)
+    print(f"{'=' * 72}\n关掉这个窗口、或者按 Ctrl-C，都会停掉服务。", flush=True)
 
     if not args.no_browser:
-        # WSL 里多半没有浏览器，webbrowser 会静默失败——所以打印 URL 才是主路径，
-        # 这里只是顺手一试，失败就算了。
-        def _try_open() -> None:
-            try:
-                webbrowser.open(url)
-            except Exception:                            # noqa: BLE001
-                pass
-
-        threading.Timer(0.4, _try_open).start()
+        # 0.4 秒是给 serve_forever 让路。socket 在 _Server(...) 里就已经 bind+listen 了，
+        # 所以浏览器这会儿连上来只是进 backlog 等一会儿，不会被拒。
+        threading.Timer(0.4, _open_browser, args=(url,)).start()
 
     try:
         server.serve_forever()

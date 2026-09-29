@@ -928,6 +928,45 @@ def selftest() -> int:
             "stage5_full(self.task, None," in launcher_src,
             "调用点写成了别的形式，回去确认第二个实参是 None",
         )
+        check("launcher.py 有 /health 身份端点", '"/health"' in launcher_src)
+
+        # 「重复双击不该起第二个服务」靠 _existing_instance 认人。真起一个服务来验，
+        # 顺带验反面：陌生端口不能被误认成自己人（认错就会把浏览器指到不相干的页面）。
+        # 绑 0 号端口让系统分配空闲端口，不会和正在跑的服务打架。
+        try:
+            import importlib.util as _ilu
+            import threading as _threading
+
+            _spec = _ilu.spec_from_file_location("_launcher_probe", launcher_path)
+            _lmod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_lmod)
+
+            # 59999 上基本不可能有东西；真有的话这条会红，那也是有用的信息。
+            check("空端口不会被误认成自己人", _lmod._existing_instance(59999) is False)
+            _probe_server = _lmod._Server(("127.0.0.1", 0), _lmod._Handler)
+            _threading.Thread(target=_probe_server.serve_forever, daemon=True).start()
+            try:
+                check(
+                    "起过的服务能被认出来",
+                    _lmod._existing_instance(_probe_server.server_address[1]) is True,
+                )
+            finally:
+                _probe_server.shutdown()
+                _probe_server.server_close()
+        except Exception as exc:                       # noqa: BLE001
+            check("启动器身份探测", False, f"{type(exc).__name__}: {exc}")
+
+    # 建桌面快捷方式那个脚本，同样只做语法检查。
+    _shortcut_path = _Path(__file__).resolve().parent / "make_shortcut.py"
+    if not _shortcut_path.is_file():
+        check("make_shortcut.py 存在", False, "文件缺失")
+    else:
+        try:
+            compile(_shortcut_path.read_text(encoding="utf-8"), "make_shortcut.py", "exec")
+            check("make_shortcut.py 语法正确", True)
+        except SyntaxError as exc:
+            check("make_shortcut.py 语法正确", False, f"{exc}")
+
     # 分层红线：launcher 依赖 main，main 绝不反向依赖 launcher。
     # 这样这个文件删掉、或者在一台没有浏览器的机器上，--selftest 照样绿。
     # 针要拼出来：直接写整串的话，这一行自己就会命中（第一次跑就踩了这个自摆乌龙）。

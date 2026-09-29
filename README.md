@@ -44,11 +44,21 @@ python main.py --selftest                                  # 离线自测：不�
 
 ### 图形界面
 
-不想看终端的话，同一个流程有个网页启动器：
+不想看终端的话，同一个流程有个网页启动器。**双击桌面的「旅行规划」图标就行**——
+它会起服务并自动打开浏览器，不用敲任何命令。（重复双击不会起第二个服务，只会把
+浏览器指到已经在跑的那个。）
+
+想从命令行起也可以：
 
 ```bash
-python launcher.py            # 起本地服务，然后开它打印的那个 URL
+python launcher.py            # 起服务，并自动打开浏览器
 python launcher.py --demo     # 离线假数据：不用 key、不联网，几秒看完整个回路
+```
+
+要重新创建那个桌面图标（比如换了机器）：
+
+```bash
+.venv/bin/python make_shortcut.py
 ```
 
 **零新增依赖**（只用标准库），也不用装 tkinter。WSL2 会把 localhost 转发到 Windows，
@@ -107,6 +117,7 @@ tools.py             search(Tavily) + calculator + 注册表
 persona.py           三个 LLM agent 的人格（角色 prompt + 格式契约）
 main.py              组队、终止条件、入口、离线自测
 launcher.py          网页启动器（可选：删掉它 --selftest 照样绿）
+make_shortcut.py     在 Windows 桌面建「点击就启动」的快捷方式（只在 WSL 上有意义）
 keys.py              key（不进 git）
 keys.example.py      keys.py 的模板
 ```
@@ -208,4 +219,5 @@ system_message = 角色 prompt + "\n\n" + 格式契约
 | 本文件 | 定位、用法、改哪里、踩过的坑、设计取舍 |
 | [docs/agents/](docs/agents/) | 四个 agent 的说明书（角色 / 能力 / 职责 / 工具 / 流程 / 输出格式） |
 | [launcher.py](launcher.py) | 网页启动器：HTTP 接口、线程模型、页面本身（模块 docstring 是主要说明） |
+| [make_shortcut.py](make_shortcut.py) | 建桌面快捷方式；顺带解释了为什么这件事不能用 `.bat` 做 |
 | [keys.example.py](keys.example.py) | key 模板与申请地址 |
