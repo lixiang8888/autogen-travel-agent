@@ -27,6 +27,10 @@ RoundRobin 每转到它就会阻塞整个 team，官方文档说这会让 team �
     python main.py "一句话需求"    # 完整流程（不传需求用内置示例）
     python main.py --selftest     # 离线自测，不需要 key、不联网
     python main.py --stage 1..4   # 调试用：逐层排查是哪一层坏的，见 README
+    python launcher.py            # 网页界面，见 README「图形界面」
+
+**这个文件不认识 launcher.py。** 反向依赖是不存在的（自测第 [10] 节守着），
+所以把 launcher.py 删掉，`--selftest` 照样绿。
 """
 
 from __future__ import annotations
@@ -898,13 +902,48 @@ def selftest() -> int:
     except Exception as exc:                       # noqa: BLE001
         check("人机回路探测", False, f"{type(exc).__name__}: {exc}")
 
+    print("\n[10] 启动器：语法自检与分层红线")
+    # 启动器是**可选**的：没装它、没浏览器、没起服务，这一节也应该能跑。
+    # 所以这里只 compile（不 exec），既不启服务器也不占端口。
+    launcher_src = ""
+    launcher_path = _Path(__file__).resolve().parent / "launcher.py"
+    if not launcher_path.is_file():
+        check("launcher.py 存在", False, "文件缺失")
+    else:
+        launcher_src = launcher_path.read_text(encoding="utf-8")
+        try:
+            compile(launcher_src, "launcher.py", "exec")
+            check("launcher.py 语法正确", True)
+        except SyntaxError as exc:
+            check("launcher.py 语法正确", False, f"{exc}")
+        check("launcher.py 通过 RunHooks 接 main", "RunHooks" in launcher_src)
+        check(
+            "launcher.py 用 format_message 而不是去解析终端文本",
+            "format_message" in launcher_src,
+        )
+        # 这条守着一个很容易再犯的坑：replies=[] 不等于「没给预设」，
+        # 传空列表会让第一次 handoff 就「预设用完」停下（见 run_with_handoffs 的注释）。
+        check(
+            "launcher.py 给 stage5_full 传 replies=None 而不是 []",
+            "stage5_full(self.task, None," in launcher_src,
+            "调用点写成了别的形式，回去确认第二个实参是 None",
+        )
+    # 分层红线：launcher 依赖 main，main 绝不反向依赖 launcher。
+    # 这样这个文件删掉、或者在一台没有浏览器的机器上，--selftest 照样绿。
+    # 针要拼出来：直接写整串的话，这一行自己就会命中（第一次跑就踩了这个自摆乌龙）。
+    _needle = "import " + "launcher"
+    check("main.py 不反向依赖启动器", _needle not in _Path(__file__).read_text(encoding="utf-8"))
+
     print("\n" + _SEP)
     if failures:
         print(f"离线自测失败 {len(failures)} 项：")
         for item in failures:
             print(f"  - {item}")
         return 1
-    print("离线自测全部通过。接线没问题，可以填 key 跑 `python main.py \"需求\"` 了。")
+    print(
+        "离线自测全部通过。接线没问题，可以填 key 跑 `python main.py \"需求\"`\n"
+        "（或者 `python launcher.py` 用网页界面）了。"
+    )
     return 0
 
 
@@ -920,6 +959,7 @@ def main(argv: list[str] | None = None) -> int:
             "例子：\n"
             '  python main.py "我国庆去诸暨玩，三天，两个人，预算 2000。"\n'
             "  python main.py --selftest\n"
+            "  python launcher.py       # 网页界面，不用终端\n"
             "\n"
             "不传需求就用内置示例任务。跑起来后 critic 会停下来问你拍板——"
             "回答时带一个具体的数字或动作，「住宿砍到 250 一晚」比「再优化一下」有用。"

@@ -42,6 +42,25 @@ python main.py --selftest                                  # 离线自测：不�
 **停下来问你**，打出 critic 的问题清单——你敲一句话回答，带具体数字或动作
 （「住宿砍到 250 一晚」比「再优化一下」有用），它继续跑；critic 说 `APPROVED` 就结束。
 
+### 图形界面
+
+不想看终端的话，同一个流程有个网页启动器：
+
+```bash
+python launcher.py            # 起本地服务，然后开它打印的那个 URL
+python launcher.py --demo     # 离线假数据：不用 key、不联网，几秒看完整个回路
+```
+
+**零新增依赖**（只用标准库），也不用装 tkinter。WSL2 会把 localhost 转发到 Windows，
+所以直接用 Windows 的浏览器开 `http://localhost:8765` 就行——不用记 WSL 的 IP。
+
+页面上：上面写需求点「开始」，中间按 agent 分色滚出对话，critic 要你拍板时下面那个
+输入框会亮起来、问题直接贴在框上面，你回一句话继续。工具调用（`→ search(...)`）会缩进
+成等宽灰字，从正文里退下去；「该你拍板了」这类版式性提示只进右上角状态栏，不进对话流。
+
+`launcher.py` 是**可选的**：删掉它，`python main.py --selftest` 照样绿——它单向依赖
+`main.py`，反过来不成立（自测第 [10] 节守着这条红线）。
+
 > 安全：`keys.py` 已在 [.gitignore](.gitignore) 中忽略、不会进 git。若曾把真实 key
 > 填进文件并外传过，请到 DeepSeek / Tavily 控制台轮换重置。
 
@@ -87,6 +106,7 @@ llm.py               DeepSeek 客户端（AutoGen 的 OpenAIChatCompletionClient
 tools.py             search(Tavily) + calculator + 注册表
 persona.py           三个 LLM agent 的人格（角色 prompt + 格式契约）
 main.py              组队、终止条件、入口、离线自测
+launcher.py          网页启动器（可选：删掉它 --selftest 照样绿）
 keys.py              key（不进 git）
 keys.example.py      keys.py 的模板
 ```
@@ -187,4 +207,5 @@ system_message = 角色 prompt + "\n\n" + 格式契约
 | --- | --- |
 | 本文件 | 定位、用法、改哪里、踩过的坑、设计取舍 |
 | [docs/agents/](docs/agents/) | 四个 agent 的说明书（角色 / 能力 / 职责 / 工具 / 流程 / 输出格式） |
+| [launcher.py](launcher.py) | 网页启动器：HTTP 接口、线程模型、页面本身（模块 docstring 是主要说明） |
 | [keys.example.py](keys.example.py) | key 模板与申请地址 |
