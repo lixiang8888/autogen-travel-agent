@@ -35,10 +35,12 @@ import argparse
 import asyncio
 import re
 import sys
+from dataclasses import dataclass
+from typing import Callable
 
 from autogen_agentchat.agents import AssistantAgent
 from autogen_agentchat.base import Handoff, TaskResult, TerminatedException, TerminationCondition
-from autogen_agentchat.conditions import HandoffTermination, MaxMessageTermination
+from autogen_agentchat.conditions import ExternalTermination, HandoffTermination, MaxMessageTermination
 from autogen_agentchat.messages import HandoffMessage, StopMessage, TextMessage
 from autogen_agentchat.teams import RoundRobinGroupChat
 
@@ -76,6 +78,13 @@ MAX_HANDOFFS = 6
 MAX_TOOL_ITERATIONS = 5
 
 _SEP = "=" * 72
+
+#: 拍板时给用户的那句提示。
+#:
+#: 独立成常量是因为图形启动器要拿它当输入框的标签——总不能让它去 strip
+#: `input()` 提示串尾巴上那个 "> "。
+ASK_HINT = "你的决定（一句话，带一个数字或一个动作）"
+_ASK_PROMPT = f"\n{ASK_HINT}> "
 
 
 # ---------------------------------------------------------------------------
@@ -168,11 +177,29 @@ def build_team(model, specs, *, termination=None, max_turns: int | None = None):
 
 
 # ---------------------------------------------------------------------------
-# 2. 跑与打印
+# 2. 跑与打印（+ 回调接缝：CLI 打印与图形界面共用同一套格式化）
 # ---------------------------------------------------------------------------
 
-def _print_message(message) -> None:
-    """打印一条消息。
+@dataclass(frozen=True)
+class FormattedMessage:
+    """一条消息格式化之后的样子。
+
+    kind 只有两种：
+        "text"  模型或用户写的正文
+        "tool"  工具调用与返回值（图形界面里会渲染成等宽、缩进、退到次要色）
+    """
+
+    source: str
+    text: str
+    kind: str
+
+
+def format_message(message) -> FormattedMessage | None:
+    """把一条消息格式化；没有可显示内容时返回 None。
+
+    **纯函数，不打印。** 抽出来是为了让终端和图形界面共用同一套格式化逻辑：
+    `_print_message` 拿它去 print，图形界面拿它去渲染。否则图形界面只能去
+    正则解析 `[source]` 那一行——那是「解析自己的终端输出」的坏味道。
 
     content 可能是 str（TextMessage），也可能是**对象列表**——工具调用类事件
     （ToolCallRequestEvent / ToolCallExecutionEvent）就是后者。早期版本直接
@@ -182,6 +209,7 @@ def _print_message(message) -> None:
     content = getattr(message, "content", "")
 
     if isinstance(content, list):
+        kind = "tool"
         lines: list[str] = []
         for item in content:
             name = getattr(item, "name", None) or type(item).__name__
@@ -198,26 +226,96 @@ def _print_message(message) -> None:
                 lines.append(f"  · {name}")
         text = "\n".join(lines)
     else:
+        kind = "text"
         text = (content or "").strip()
 
     if not text:
+        return None
+    return FormattedMessage(source=source, text=text, kind=kind)
+
+
+def _print_message(message) -> None:
+    """打印一条消息。
+
+    **签名不许动**——selftest 第 [7] 节以单参数调它，守着「工具调用事件不能崩」
+    这条回归。要换出口请用 `RunHooks.on_message`，不要给它加参数。
+    """
+    formatted = format_message(message)
+    if formatted is None:
         return
-    print(f"\n{_SEP}\n[{source}]\n{_SEP}")
-    print(text)
+    print(f"\n{_SEP}\n[{formatted.source}]\n{_SEP}")
+    print(formatted.text)
 
 
-async def run_and_print(team, task) -> TaskResult:
-    """流式跑，实时打印每条消息，返回 TaskResult。
+def _print_notice(text: str, kind: str = "plain") -> None:
+    """终端版通知出口。**所有终端版式都锁在这一个函数里。**
+
+    kind 的六种取值一一对应重构前的六处 print，逐字节等价。别想着合并——
+    `note` 和 `plain` 的区别就是前导换行，合并了输出就变了：
+
+        banner    行首换行 + `=` 框    「该你拍板了（第 N 次）」
+        final     行首换行 + `=` 框    「结束原因：…」
+        note      行首换行             回答回显、预设用完、没有拿到输入
+        question  原样                  critic 的问题清单（人必须读的正文）
+        plain     原样                 「（空输入，停止。）」
+        warning   原样                 撞到轮数上限的警告
+    """
+    if kind in ("banner", "final"):
+        print(f"\n{_SEP}\n{text}\n{_SEP}")
+    elif kind == "note":
+        print(f"\n{text}")
+    else:                                   # question / plain / warning
+        print(text)
+
+
+def _console_ask(prompt: str) -> str | None:
+    """终端版拍板输入。返回 None 表示拿不到输入（EOF 或 Ctrl-C）。"""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        # stdin 是空的（非交互跑）或用户按了 Ctrl-C/Ctrl-D。
+        # 这里不该糊一个 traceback——没输入就干净地停在当前进度。
+        return None
+
+
+@dataclass
+class RunHooks:
+    """一次 run 的出口与开关。默认值 = 终端行为；图形启动器传自己的实现。
+
+    `ask` 是**同步**的，别改成 async。包成 `asyncio.to_thread(input, ...)` 之后：
+      1. Python 只在主线程处理信号，3.11+ 的 Runner 会把第一次 Ctrl-C 变成
+         `main_task.cancel()`，下面的 `except KeyboardInterrupt` 就接不到了，
+         行为从「干净停在当前进度」变成「被取消」；
+      2. `asyncio.run` 收尾时 `shutdown_default_executor()` 会 join 那个仍阻塞在
+         stdin 上的线程（3.12+ 默认无限等），**进程退出时会挂死**。
+    同步版把 `input()` 留在原来那个线程、那个位置，catch 原封不动。
+    图形界面那边同样是把 worker 线程阻塞在队列上等人回话，形态与本函数一致。
+    """
+
+    on_message: Callable[[object], None] = _print_message
+    on_notice: Callable[[str, str], None] = _print_notice
+    ask: Callable[[str], str | None] = _console_ask
+    #: 外部停止开关。None = 不提供停止（终端路径的默认情形，对象图与重构前完全相同）。
+    stop: ExternalTermination | None = None
+
+
+async def run_and_print(team, task, *, on_message=None) -> TaskResult:
+    """流式跑，实时报告每条消息，返回 TaskResult。
 
     用 run_stream 而不是 run，是因为一次完整对话要十几轮 LLM 调用，
     等全部跑完再打印会让人以为卡死了。
+
+    Args:
+        on_message: 收到**原始 message 对象**的回调——不是格式化好的字符串，
+            调用方自己决定怎么渲染。不给就是打印到终端。
     """
+    report = on_message or _print_message
     result: TaskResult | None = None
     async for message in team.run_stream(task=task):
         if isinstance(message, TaskResult):
             result = message
         else:
-            _print_message(message)
+            report(message)
     assert result is not None, "run_stream 没有返回 TaskResult"
     return result
 
@@ -261,6 +359,34 @@ def last_substantive_content(result: TaskResult) -> str:
         if isinstance(content, str) and content.strip():
             return content.strip()
     return ""
+
+
+def resolve_answer(queue, scripted, ask, handoffs, notice) -> str | None:
+    """拿一个拍板答案。返回 None 表示该停下来了。
+
+    **分支顺序是有意的，别调**：预设队列 > 预设用完就停 > 才轮到问人。
+
+    「预设用完就停」锁死的是「绝不回退到 input()」这条规矩——后台/管道场景下
+    stdin 可能是「开着但不给数据」，input() 不抛 EOFError 而是永久阻塞，最后被
+    timeout 杀掉（实测撞过一次，白烧 30 分钟才看出来）。见 README 第 8 条坑。
+    """
+    if queue:
+        answer = queue.pop(0).strip()
+        notice(f"[--reply 第 {handoffs} 个回答] {answer}", "note")
+    elif scripted:
+        notice("（预设回答已用完，停在当前进度。）", "note")
+        return None
+    else:
+        raw = ask(_ASK_PROMPT)
+        if raw is None:
+            notice("（没有拿到输入，停在当前进度。）", "note")
+            return None
+        answer = raw.strip()
+
+    if not answer:
+        notice("（空输入，停止。）", "plain")
+        return None
+    return answer
 
 
 # ---------------------------------------------------------------------------
@@ -348,62 +474,85 @@ async def stage4_with_critic() -> None:
     await model.close()
 
 
-async def stage5_full(task: str, replies: list[str] | None = None) -> None:
-    """阶段 5 · 终止条件与 user 回路。
+async def run_with_handoffs(team, task, replies=None, *, hooks=None) -> TaskResult:
+    """跑一轮完整流程 + 人机回路。**只认 team 和 hooks，不认识 model。**
 
     验证点：连跑三次，每次都在合理轮数内自然结束（而不是撞到 15 轮上限）。
     撞上限说明 critic 不肯说 APPROVED，回去改它的 system_message。
 
+    和 stage5_full 分成两层是为了**可测性**：stage5_full 第一行就 build_model()，
+    一要 key 二要联网，于是这段最贵、最易错的回路在离线自测里覆盖率一直是零。
+    切开之后一个假 team 就能把它整段跑穿（见 selftest 第 [9] 节）。
+
     Args:
         replies: 预设的拍板回答，第 N 次 handoff 用第 N 个。给完就停。
-            一个都不给则每次读一行标准输入。用于非交互跑（脚本化、CI、
+            一个都不给则每次调 hooks.ask。用于非交互跑（脚本化、CI、
             或者「用不同的回答测收敛性」）。
+            **注意 `replies=[]` 不等于「没给」**——下面 scripted 判的是 `is not None`，
+            传空列表会在第一次 handoff 就「预设用完」停下。不想预设就传 None。
+        hooks: 出口回调。不给就是打印到终端、读键盘。
     """
-    model = build_model()
-    team = build_team(model, (RESEARCHER, PLANNER, CRITIC), termination=build_termination())
+    hooks = hooks or RunHooks()
 
     queue = list(replies or [])
     scripted = replies is not None      # 给了 --reply：用完就干净停下
-    result = await run_and_print(team, task)
+    result = await run_and_print(team, task, on_message=hooks.on_message)
     handoffs = 0
     while stopped_for_user(result) and handoffs < MAX_HANDOFFS:
         handoffs += 1
-        print(f"\n{_SEP}\n该你拍板了（第 {handoffs} 次）\n{_SEP}")
+        hooks.on_notice(f"该你拍板了（第 {handoffs} 次）", "banner")
         # 取正文而不是 handoff 那句固定话（Handoff 工具是零参数的，见该函数注释）
-        print(last_substantive_content(result) or "（critic 没写出问题清单，只调了 handoff 工具）")
+        hooks.on_notice(
+            last_substantive_content(result) or "（critic 没写出问题清单，只调了 handoff 工具）",
+            "question",
+        )
 
-        if queue:
-            answer = queue.pop(0).strip()
-            print(f"\n[--reply 第 {handoffs} 个回答] {answer}")
-        elif scripted:
-            # 预设回答用完就停。**不要回退到 input()**——后台/管道场景下 stdin 可能是
-            # 「开着但不给数据」，input() 不抛 EOFError 而是永久阻塞，最后被 timeout
-            # 杀掉（实测撞过一次，白烧 30 分钟才看出来）。
-            print("\n（预设回答已用完，停在当前进度。）")
+        answer = resolve_answer(queue, scripted, hooks.ask, handoffs, hooks.on_notice)
+        if answer is None:
             break
-        else:
-            try:
-                answer = input("\n你的决定（一句话，带一个数字或一个动作）> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                # stdin 是空的（非交互跑）或用户按了 Ctrl-C/Ctrl-D。
-                # 这里不该糊一个 traceback——没输入就干净地停在当前进度。
-                print("\n（没有拿到输入，停在当前进度。）")
-                break
 
-        if not answer:
-            print("（空输入，停止。）")
-            break
         # 续跑必须用 HandoffMessage，交回给触发 handoff 的那个 agent
         target = getattr(result.messages[-1], "source", CRITIC.name)
         result = await run_and_print(
-            team, HandoffMessage(source="user", target=target, content=answer)
+            team, HandoffMessage(source="user", target=target, content=answer),
+            on_message=hooks.on_message,
         )
 
-    await model.close()
-
-    print(f"\n{_SEP}\n结束原因：{result.stop_reason}\n{_SEP}")
+    hooks.on_notice(f"结束原因：{result.stop_reason}", "final")
     if result.stop_reason and "Maximum number of messages" in str(result.stop_reason):
-        print("⚠️  撞到轮数上限了。这不算自然结束——回去查 critic 为什么不肯说 APPROVED。")
+        hooks.on_notice(
+            "⚠️  撞到轮数上限了。这不算自然结束——回去查 critic 为什么不肯说 APPROVED。",
+            "warning",
+        )
+    return result
+
+
+async def stage5_full(task: str, replies: list[str] | None = None, *, hooks=None) -> None:
+    """阶段 5 · 完整流程（含人机回路），日常用法。
+
+    这一层只管**模型与队伍的生命周期**，对话流程在 run_with_handoffs 里。
+
+    Args:
+        replies: 透传给 run_with_handoffs 的预设拍板回答，语义见那个函数。
+        hooks: 出口回调。不给就是打印到终端、读键盘。
+    """
+    model = build_model()
+    try:
+        termination = build_termination()
+        if hooks is not None and hooks.stop is not None:
+            # 外部停止开关用 `|` **外挂**，不动 build_termination()——selftest 第 [6]
+            # 节依赖它的行为。终端路径 hooks.stop is None，对象图与重构前完全相同。
+            #
+            # 为什么用 ExternalTermination 而不是 task.cancel()：它让「停止」走的是本来
+            # 就存在的那条路——run_stream 正常返回 TaskResult（stop_reason 里写着
+            # "External termination requested"），run_and_print 的 assert 不用动，
+            # 也不用伪造 TaskResult。粒度是一个 agent 回合。
+            termination = termination | hooks.stop
+        team = build_team(model, (RESEARCHER, PLANNER, CRITIC), termination=termination)
+        await run_with_handoffs(team, task, replies, hooks=hooks)
+    finally:
+        # 循环中途抛异常时也要关掉 client（重构前这条路径会漏关）。
+        await model.close()
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +721,182 @@ def selftest() -> int:
             continue
         check(f"{spec.name} §8.1 与 role_prompt 一致", s81 == spec.role_prompt.strip())
         check(f"{spec.name} §8.2 与 format_contract 一致", s82 == spec.format_contract.strip())
+
+    print("\n[9] 人机回路：回调接缝与 --reply 队列（不需要 key、不联网）")
+    # 这一段是补历史欠账：stage5_full 第一行就 build_model()，离线跑不动，所以
+    # 「handoff 回路」这个最贵、最易错的部件此前在自测里覆盖率是零。抽出
+    # run_with_handoffs 之后用假 team 就能把它整段跑穿。
+    import contextlib
+    import io
+    from types import SimpleNamespace
+
+    from autogen_agentchat.messages import ToolCallRequestEvent
+    from autogen_core import FunctionCall
+
+    tool_event = ToolCallRequestEvent(
+        source="researcher",
+        content=[FunctionCall(id="c1", name="search", arguments='{"query":"成都"}')],
+    )
+
+    class _FakeTeam:
+        """按脚本吐消息的假 team。不联网、不建模型、不烧 token。"""
+
+        def __init__(self, scripts):
+            self._scripts = list(scripts)
+            self._all: list = []
+            self.tasks: list = []          # 记下每次 run_stream 收到的 task
+
+        async def run_stream(self, *, task=None):
+            self.tasks.append(task)
+            batch = self._scripts.pop(0) if self._scripts else []
+            self._all.extend(batch)
+            for message in batch:          # async 生成器里不能用 yield from
+                yield message
+            # 累积而不是只给当前批：真 AutoGen 的 TaskResult.messages 是整轮的，
+            # 而 run_with_handoffs 靠 result.messages[-1] 判断是不是又轮到人了。
+            yield TaskResult(messages=list(self._all))
+
+    def _handoff_batch(question: str) -> list:
+        """一批消息：critic 的问题清单 + 它请求拍板。"""
+        return [
+            TextMessage(source="critic", content=question),
+            HandoffMessage(source="critic", target="user", content="需要用户拍板"),
+        ]
+
+    # ---- A. 格式层：抽出来的纯函数要保住原来那两条分支 ----
+    fm = format_message(tool_event)
+    check("format_message 认出工具调用事件", fm is not None and fm.kind == "tool", f"实际：{fm}")
+    check("format_message 保留了 → 调用行", fm is not None and "→ search(" in fm.text)
+    fake_return = SimpleNamespace(
+        source="researcher", content=[SimpleNamespace(name="search", content="x" * 500)]
+    )
+    fm_long = format_message(fake_return)
+    check(
+        "工具返回超 400 字符会截断并报总长",
+        fm_long is not None and "…（共 500 字符）" in fm_long.text,
+        f"实际：{fm_long.text[:60] if fm_long else None}",
+    )
+    check("空白消息返回 None", format_message(TextMessage(source="x", content="   ")) is None)
+
+    # ---- B. 硬约束：_print_message 必须还能单参数调（selftest [7] 依赖它）----
+    with contextlib.redirect_stdout(io.StringIO()):
+        _print_message(TextMessage(source="planner", content="正文"))
+    check("_print_message 仍能单参数调", True)
+
+    # ---- C. 六种通知的终端版式逐字节锁定 ----
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        _print_notice("该你拍板了（第 1 次）", "banner")
+        _print_notice("问题清单", "question")
+        _print_notice("[--reply 第 1 个回答] 砍住宿", "note")
+        _print_notice("（空输入，停止。）", "plain")
+        _print_notice("结束原因：x", "final")
+        _print_notice("⚠️ 警告", "warning")
+    expect = (
+        f"\n{_SEP}\n该你拍板了（第 1 次）\n{_SEP}\n"
+        "问题清单\n"
+        "\n[--reply 第 1 个回答] 砍住宿\n"
+        "（空输入，停止。）\n"
+        f"\n{_SEP}\n结束原因：x\n{_SEP}\n"
+        "⚠️ 警告\n"
+    )
+    check("六种通知的终端版式逐字节不变", buf.getvalue() == expect, f"实际：{buf.getvalue()!r}")
+
+    def _quiet(**over):
+        """一套静默 hooks，只覆盖需要观察的那几个出口。"""
+        base = {
+            "on_message": lambda message: None,
+            "on_notice": lambda text, kind: None,
+            "ask": lambda prompt: None,
+        }
+        base.update(over)
+        return RunHooks(**base)
+
+    async def _probe_hooks() -> dict:
+        out: dict = {}
+
+        # ① 续跑必须用 HandoffMessage，且交回给触发 handoff 的那个 agent
+        seen: list = []
+        team = _FakeTeam([_handoff_batch("住宿 400 超预算，怎么办？"),
+                          [TextMessage(source="critic", content="APPROVED")]])
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            res = await run_and_print(team, "任务", on_message=seen.append)
+        out["原始对象"] = bool(seen) and getattr(seen[0], "content", None) == "住宿 400 超预算，怎么办？"
+        out["不打印"] = stdout.getvalue() == ""
+        out["返回 TaskResult"] = isinstance(res, TaskResult)
+
+        team = _FakeTeam([_handoff_batch("住宿 400 超预算，怎么办？"),
+                          [TextMessage(source="critic", content="APPROVED")]])
+        await run_with_handoffs(
+            team, "任务", None, hooks=_quiet(ask=lambda prompt: "住宿砍到 250 一晚")
+        )
+        out["续跑条数"] = len(team.tasks)
+        second = team.tasks[1] if len(team.tasks) > 1 else None
+        out["续跑是 HandoffMessage"] = isinstance(second, HandoffMessage)
+        out["续跑 source"] = getattr(second, "source", None)
+        out["续跑 target"] = getattr(second, "target", None)
+        out["续跑 content"] = getattr(second, "content", None)
+
+        # ② --reply 用完就停，且**绝不回退到 ask**（README 第 8 条坑）
+        asked: list = []
+        team = _FakeTeam([_handoff_batch(f"问题 {i}") for i in range(4)])
+        await run_with_handoffs(
+            team, "任务", ["住宿砍到 250", "改高铁"],
+            hooks=_quiet(ask=lambda prompt: asked.append(prompt) or "不该被调到"),
+        )
+        out["预设用完时 ask 次数"] = len(asked)
+        out["预设用完跑了几次"] = len(team.tasks)
+
+        # ③ ask 拿不到输入 / ④ ask 返回空串：两条都必须干净停下
+        for label, reply in (("没有输入", None), ("空输入", "")):
+            notices: list = []
+            team = _FakeTeam([_handoff_batch("问题")])
+            await run_with_handoffs(
+                team, "任务", None,
+                hooks=_quiet(ask=lambda prompt, r=reply: r,
+                             on_notice=lambda text, kind: notices.append((text, kind))),
+            )
+            out[f"{label} 通知"] = notices
+            out[f"{label} 条数"] = len(team.tasks)
+
+        # ⑤ 最多问 MAX_HANDOFFS 次就收手
+        team = _FakeTeam([_handoff_batch(f"问题 {i}") for i in range(8)])
+        await run_with_handoffs(team, "任务", None, hooks=_quiet(ask=lambda prompt: "继续"))
+        out["封顶条数"] = len(team.tasks)
+        return out
+
+    try:
+        hooks_probe = asyncio.run(_probe_hooks())
+        check("on_message 收到原始 message 对象", hooks_probe["原始对象"])
+        check("on_message 给了就不再打印到 stdout", hooks_probe["不打印"],
+              f"实际：{hooks_probe['不打印']!r}")
+        check("run_and_print 仍返回 TaskResult", hooks_probe["返回 TaskResult"])
+        check("续跑了一次", hooks_probe["续跑条数"] == 2, f"实际：{hooks_probe['续跑条数']}")
+        check("续跑用的是 HandoffMessage", hooks_probe["续跑是 HandoffMessage"])
+        check("续跑 source 是 user", hooks_probe["续跑 source"] == "user",
+              f"实际：{hooks_probe['续跑 source']}")
+        check("续跑交回给 critic（触发 handoff 的那个）", hooks_probe["续跑 target"] == "critic",
+              f"实际：{hooks_probe['续跑 target']}")
+        check("续跑 content 是人的原话", hooks_probe["续跑 content"] == "住宿砍到 250 一晚",
+              f"实际：{hooks_probe['续跑 content']}")
+        check("--reply 预设用完绝不回退到 ask", hooks_probe["预设用完时 ask 次数"] == 0,
+              f"实际调了 {hooks_probe['预设用完时 ask 次数']} 次")
+        check("--reply 第 3 次不给就停（1 首次 + 2 续跑）", hooks_probe["预设用完跑了几次"] == 3,
+              f"实际：{hooks_probe['预设用完跑了几次']}")
+        check("ask 拿不到输入 → 干净停下",
+              ("（没有拿到输入，停在当前进度。）", "note") in hooks_probe["没有输入 通知"])
+        check("拿不到输入后不再续跑", hooks_probe["没有输入 条数"] == 1,
+              f"实际：{hooks_probe['没有输入 条数']}")
+        check("ask 返回空串 → 空输入停止",
+              ("（空输入，停止。）", "plain") in hooks_probe["空输入 通知"])
+        check("空输入后不再续跑", hooks_probe["空输入 条数"] == 1,
+              f"实际：{hooks_probe['空输入 条数']}")
+        check(f"最多问 {MAX_HANDOFFS} 次就收手（1 首次 + {MAX_HANDOFFS} 续跑）",
+              hooks_probe["封顶条数"] == MAX_HANDOFFS + 1,
+              f"实际：{hooks_probe['封顶条数']}")
+    except Exception as exc:                       # noqa: BLE001
+        check("人机回路探测", False, f"{type(exc).__name__}: {exc}")
 
     print("\n" + _SEP)
     if failures:
