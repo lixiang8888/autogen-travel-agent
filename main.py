@@ -8,7 +8,7 @@ main.py —— 组队 + 跑：拓扑、终止条件、入口
 
 **拓扑**：RoundRobinGroupChat，固定顺序 researcher → planner → critic → 循环。
 起步不用 SelectorGroupChat：先要可预测，再要聪明。等整个流程跑通了、知道「正常的
-对话长什么样」了，再换拓扑做对照实验（见 README「设计取舍」）。
+对话长什么样」了，再换拓扑做对照实验（见 docs/architecture.md 第 8 节）。
 
 **终止条件**：三重，缺一不可。
     ExactTextTermination("APPROVED", "critic")  critic 认可（精确匹配，非子串）
@@ -27,7 +27,7 @@ RoundRobin 每转到它就会阻塞整个 team，官方文档说这会让 team �
     python main.py "一句话需求"    # 完整流程（不传需求用内置示例）
     python main.py --selftest     # 离线自测，不需要 key、不联网
     python main.py --stage 1..4   # 调试用：逐层排查是哪一层坏的，见 README
-    python launcher.py            # 网页界面，见 README「图形界面」
+    python launcher.py            # 网页界面，见 README「网页版」
 
 **这个文件不认识 launcher.py。** 反向依赖是不存在的（自测第 [10] 节守着），
 所以把 launcher.py 删掉，`--selftest` 照样绿。
@@ -78,7 +78,7 @@ MAX_HANDOFFS = 6
 #:   - critic 调完 calculator 就没下文了，永远不会说 APPROVED
 #:
 #: 只有 planner 看上去正常——因为它没有工具，content 直接就是字符串。
-#: 见 README「实测踩过的坑」第 2 条。
+#: 见 docs/architecture.md 第 7 节第 2 条。
 MAX_TOOL_ITERATIONS = 5
 
 _SEP = "=" * 72
@@ -111,7 +111,7 @@ class ExactTextTermination(TerminationCondition):
     那次侥幸蒙对了（泄露的思考恰好也是通过），但方向反过来就是静默的错交付。
 
     这条契约 docs/agents/critic.md §8.2 本来就写着（「该行必须只有 APPROVED 这八个
-    字符」），这里让代码去强制执行它，而不是指望模型自觉。见 README「实测踩过的坑」第 3 条。
+    字符」），这里让代码去强制执行它，而不是指望模型自觉。见 docs/architecture.md 第 7 节第 3 条。
     """
 
     def __init__(self, text: str, source: str) -> None:
@@ -372,7 +372,7 @@ def resolve_answer(queue, scripted, ask, handoffs, notice) -> str | None:
 
     「预设用完就停」锁死的是「绝不回退到 input()」这条规矩——后台/管道场景下
     stdin 可能是「开着但不给数据」，input() 不抛 EOFError 而是永久阻塞，最后被
-    timeout 杀掉（实测撞过一次，白烧 30 分钟才看出来）。见 README 第 8 条坑。
+    timeout 杀掉（实测撞过一次，白烧 30 分钟才看出来）。见 docs/architecture.md 第 7 节第 8 条。
     """
     if queue:
         answer = queue.pop(0).strip()
@@ -598,7 +598,7 @@ def selftest() -> int:
         got = calculator(bad)
         check(f"拒绝 {bad[:28]!r}", got.startswith("计算失败"), f"实际：{got}")
 
-    print("\n[3] 工具：挂载关系与 README「谁有什么工具」表一致")
+    print("\n[3] 工具：挂载关系与 README「三个 AI 分别干什么」表一致")
     # 联网的四把（search / fetch_page / taxi_fare / hotel_options）必须都只挂在 researcher
     # 身上——它们合起来才是「唯一联网者」这一条权力，拆开挂给别人照样废掉拓扑（tools.py 文件头）。
     check(
@@ -872,7 +872,7 @@ def selftest() -> int:
         out["续跑 target"] = getattr(second, "target", None)
         out["续跑 content"] = getattr(second, "content", None)
 
-        # ② --reply 用完就停，且**绝不回退到 ask**（README 第 8 条坑）
+        # ② --reply 用完就停，且**绝不回退到 ask**（docs/architecture.md 第 7 节第 8 条）
         asked: list = []
         team = _FakeTeam([_handoff_batch(f"问题 {i}") for i in range(4)])
         await run_with_handoffs(

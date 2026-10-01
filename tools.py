@@ -16,11 +16,11 @@ researcher 那四把是**同一把权力的四个动作**：「搜得到」「�
 新的划界。挂到别人身上照样会废掉拓扑——理由同下。
 
 `taxi_fare` 为什么必须是个工具、而不是让 researcher 拿运价表自己乘：它要的
-**里程数**搜不出来，只能算。见 README「踩过的坑」第 11 条。
+**里程数**搜不出来，只能算。见 docs/architecture.md 第 7 节第 11 条。
 
 `hotel_options` 为什么查的是**档位**而不是房价：酒店实价按日期和房型动态生成、
 且在登录墙后面，`fetch_page` 打开携程酒店页只拿得到一张登录表单。能查的只有
-「这一带有哪些连锁、哪家是哪一档」。见 README「踩过的坑」第 13 条。
+「这一带有哪些连锁、哪家是哪一档」。见 docs/architecture.md 第 7 节第 13 条。
 
 这个不对称是刻意的，不是省事：如果 planner 也能搜，它就会绕过 researcher 自己查，
 群聊立刻退化成三个各自为战的单 agent。所以「谁能用哪个工具」是这个拓扑的地基，
@@ -48,11 +48,11 @@ TAVILY_MAX_RESULTS = 5
 
 #: 搜索深度。**别退回 "basic"**：实测同一条「诸暨 景点 门票价格」，basic 返回的 5 条
 #: 里没有一条带票价（全是攻略聚合页和一日游产品），advanced 能带出 4 个具体票价。
-#: 代价见 README「踩过的坑」第 9 条。
+#: 代价见 docs/architecture.md 第 7 节第 9 条。
 TAVILY_SEARCH_DEPTH = "advanced"
 
 #: fetch_page 单页正文的字符上限。Tavily 的 advanced 提取一页常有两三千字，而
-#: researcher 一轮要抓好几次，全文灌进群聊会顶爆上下文（README「设计取舍」承认
+#: researcher 一轮要抓好几次，全文灌进群聊会顶爆上下文（docs/architecture.md 第 8 节承认
 #: 上下文膨胀是既定代价，但没理由主动加码）。超长就截断，并在文末说明截过。
 FETCH_MAX_CHARS = 4000
 

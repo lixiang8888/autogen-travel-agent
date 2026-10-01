@@ -1,6 +1,6 @@
 # user —— 需求方与拍板人
 
-> 本文是 [README.md](../../README.md) 的展开：`user` 的角色、边界与产出契约。
+> 本文是 [架构说明](../architecture.md) 的展开：`user` 的角色、边界与产出契约。
 
 **体例说明**：`user` 是 `UserProxyAgent`，代表你本人，**不是 LLM agent**——它没有 `system_message`、没有工具、没有可调的 prompt。所以本文保留与另外三份相同的 8 个节名，但每节按**人机接口**重新定义。§8 不给代码块，给的是你自己该怎么说话。
 

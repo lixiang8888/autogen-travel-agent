@@ -11,3 +11,6 @@ __pycache__/
 # 虚拟环境
 .venv/
 venv/
+
+# Windows 快捷方式 —— make_shortcut.py 本该把它建在桌面上，掉在项目根目录的是误产物
+*.lnk

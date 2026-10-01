@@ -1,6 +1,6 @@
 # planner —— 行程编排者
 
-> 本文是 [README.md](../../README.md) 的展开：`planner` 的角色、边界与产出契约。
+> 本文是 [架构说明](../architecture.md) 的展开：`planner` 的角色、边界与产出契约。
 
 ## 1. 角色
 
@@ -37,7 +37,7 @@
 **盲区**：
 
 - **不能联网补查**。素材里缺的东西，它只能标「待确认」，不能自己去搜。
-- **不能验证素材真假**。`researcher` 搜回一个错价，它照抄，`critic` 也查不出来（见 README「设计取舍」）。
+- **不能验证素材真假**。`researcher` 搜回一个错价，它照抄，`critic` 也查不出来（见 docs/architecture.md 第 8 节）。
 - **不做预算判断**。见 §5。
 
 ## 5. 职责
@@ -157,7 +157,7 @@ planner = AssistantAgent(name="planner", system_message=..., model_client=model)
 这一种——它本来就不是估算，是约束。
 
 **为什么是「每轮输出完整表」而不是「只输出改动的 Day」**：后者是我最初写下的，动机
-是省 token，但那是个**过早优化**——README「设计取舍」明确告诫「不做优化，先接受」，
+是省 token，但那是个**过早优化**——docs/architecture.md 第 8 节明确告诫「不做优化，先接受」，
 因为「过早优化会让『跑不对』和『省 token』两个问题缠在一起，没法 debug」。实测正是
 如此：critic 反复报「表不完整」「口径不明」，而我分不清是 planner 没写好还是契约逼的。
 
