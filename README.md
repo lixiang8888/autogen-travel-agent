@@ -80,7 +80,7 @@ python launcher.py --demo     # 离线假数据：不用 key、不联网，几�
 
 | Agent | 工具 | 独有的权力 |
 | --- | --- | --- |
-| `researcher` | `search` + `fetch_page` | 全队唯一能联网 |
+| `researcher` | `search` + `fetch_page` + `taxi_fare` | 全队唯一能联网 |
 | `planner` | 无 | —— |
 | `critic` | `calculator` + handoff | 唯一能算账、唯一持对抗立场 |
 | `user`（你） | 无 | 需求与拍板权 |
@@ -113,7 +113,7 @@ APPROVED」）就会提前终止，把没审完的行程当通过交付。见「
 README.md            本文件：定位、用法、改哪里、踩过的坑
 docs/agents/         四个 agent 的说明书：角色、边界、产出契约
 llm.py               DeepSeek 客户端（AutoGen 的 OpenAIChatCompletionClient）
-tools.py             search + fetch_page(Tavily) + calculator + 注册表
+tools.py             search + fetch_page(Tavily) + taxi_fare(高德) + calculator + 注册表
 persona.py           三个 LLM agent 的人格（角色 prompt + 格式契约）
 main.py              组队、终止条件、入口、离线自测
 launcher.py          网页启动器（可选：删掉它 --selftest 照样绿）
@@ -210,6 +210,26 @@ system_message = 角色 prompt + "\n\n" + 格式契约
    缺口被一个自算的日均值盖住，交付出去的是**假的确定性**。**改法**：契约改成照抄原始
    口径（费率、票种、免票条件），`planner` 的判据从「素材里有没有数字」收紧成「能不能
    直接算成这一项的总额」。缺口从此显形为「待确认」，而不是被抹平。
+11. **「当地打车钱」不是一条网页，是一次乘法。** 第 10 条把缺口暴露出来之后，
+   下一步是把它填上——但 `search` 结构上填不了：它能查回**运价表**（起步价 10 元 /
+   3 公里、续程 2.4 元 / 公里），给不了「从诸暨站到五泄多少钱」，那要按实际里程算。
+   **改法**：接高德 Web 服务的路径规划，`route.taxi_cost` 直接给估价。接的过程踩了
+   三个坑：
+   - **`taxi_cost` 在 `route` 层级，不在 `paths[]` 里。** 顺着 path 找会找不着。
+   - **带上 `strategy` / `extensions` 反而报 `MISSING_REQUIRED_PARAMS`**，而最简参数集
+     本来就返回 `taxi_cost`。参数越少越对，反直觉但实测如此。
+   - **漏传 `key` 的表现是 `INVALID_USER_KEY`。** 第一版只给路径规划那一处加了 key，
+     地理编码那两处漏了，报错长得像「key 坏了」。已改成在 `_amap_get` 里统一注入。
+   **还有一个不是 bug、是事实的偏差**：`taxi_cost` 走通用计价模型，不套当地运价文件。
+   同一条路线高德报 71 元、按诸暨公布的运价手算（含「超 8 公里部分加收 40% 回空补贴」）
+   是 86 元——**差 18%**。所以工具输出里写死了「未套用当地运价文件，可能有出入」，
+   不让它被当成确定值报出去。
+12. **新建的高德 key QPS 很紧，连着调三四次就 10021。** `taxi_fare` 一次要发三次请求
+   （两次地理编码 + 一次路径规划），实测连着跑几条路线就撞上
+   `CUQPS_HAS_EXCEEDED_THE_LIMIT`，报错是「终点搞不定」，看着像地名有问题，其实不是。
+   **改法**：`_amap_get` 对 10004 / 10021 做退避重试（1.2 秒 × 3 次）——这两个码的意思是
+   「你太快了」而不是「你错了」，等一会儿原样重发就过。做**个人认证**能放宽这个限制，
+   顺带把月配额提到 15 万次。
 
 ### 设计取舍
 

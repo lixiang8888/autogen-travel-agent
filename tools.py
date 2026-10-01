@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-tools.py —— 工具：search + fetch_page（Tavily）+ calculator
-=============================================================
+tools.py —— 工具：search + fetch_page（Tavily）、taxi_fare（高德）、calculator
+================================================================================
 
-**只有三个工具，联网的两把都只挂给一个 agent**（划界判据：工具集不同，或信息视野不同）：
+**四个工具，联网的三把都只挂给一个 agent**（划界判据：工具集不同，或信息视野不同）：
 
     search      → researcher，全队唯一联网者
     fetch_page  → researcher，同上（搜到的摘要截断时读全文）
+    taxi_fare   → researcher，同上（两地之间的驾车距离/耗时/打车估价）
     calculator  → critic，全队唯一算账者
 
-`search` 和 `fetch_page` 是**同一把权力的两个动作**（「查得到」和「读得全」），所以
-一起挂给 researcher，不构成新的划界。挂到别人身上照样会废掉拓扑——理由同下。
+researcher 那三把是**同一把权力的三个动作**：「搜得到」「读得全」「算得出路线」。
+它们是同一条信息视野的三个入口，所以一起挂给 researcher，不构成新的划界。
+挂到别人身上照样会废掉拓扑——理由同下。
+
+`taxi_fare` 为什么必须是个工具、而不是让 researcher 拿运价表自己乘：它要的
+**里程数**搜不出来，只能算。见 README「踩过的坑」第 11 条。
 
 这个不对称是刻意的，不是省事：如果 planner 也能搜，它就会绕过 researcher 自己查，
 群聊立刻退化成三个各自为战的单 agent。所以「谁能用哪个工具」是这个拓扑的地基，
@@ -31,7 +36,7 @@ import ast
 import operator
 from collections.abc import Callable
 
-from llm import ENV_TAVILY, load_key
+from llm import ENV_AMAP, ENV_TAVILY, load_key
 
 TAVILY_BASE = "https://api.tavily.com"
 TAVILY_MAX_RESULTS = 5
@@ -148,7 +153,165 @@ def fetch_page(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3. calculator —— 只挂给 critic
+# 3. taxi_fare —— 只挂给 researcher
+# ---------------------------------------------------------------------------
+
+AMAP_BASE = "https://restapi.amap.com/v3"
+
+#: 高德的错误码 → 人话。模型看不懂 INVALID_USER_KEY，但看得懂「key 没配」。
+#: 10009 单列出来，是因为它最容易误判：key 本身是好的，只是创建时服务平台
+#: 选成了 Android/iOS——那种 key 调不了 restapi，报错却像是 key 坏了。
+_AMAP_ERRORS: dict[str, str] = {
+    "10001": "高德 key 无效，检查 AMAP_API_KEY 是否填对",
+    "10002": "高德 key 被停用或已删除",
+    "10003": "高德 key 今日调用量超限",
+    "10004": "高德 key 调用过于频繁，稍后重试",
+    "10009": "高德 key 的服务平台类型不对：这个 key 必须建在「Web服务」平台下，"
+             "Android/iOS 平台的 key 调不了 restapi",
+    "10021": "高德 QPS 超限——新 key 的并发限制很紧。等几秒重试；持续出现就去做"
+             "个人认证提升配额",
+    "20000": "高德服务暂时不可用",
+    "20800": "高德返回了规划失败（起终点太近或无法驾车抵达）",
+    "30001": "高德没能解析这个地名，换个更完整的写法（带上城市、区县，或写成「XX路XX号」）",
+}
+
+#: 这些码是「你太快了」，不是「你错了」——等一会儿原样重试即可。
+#: 一次 taxi_fare 要连发三次请求（两次地理编码 + 一次路径规划），而实测新 key
+#: 连续调三四次就会撞上 10021，所以重试不是防御性编程，是必需。
+_AMAP_RETRY_INFOCODES = frozenset({"10004", "10021"})
+_AMAP_RETRY_TIMES = 3
+_AMAP_RETRY_WAIT_SEC = 1.2
+
+
+def _amap_get(path: str, params: dict[str, str], api_key: str) -> tuple[dict, str]:
+    """调一次高德 Web 服务。返回 (数据, 错误信息)。错误信息为空串表示成功。
+
+    key 在这里统一注入——每个高德接口都要它，散在各调用点上一定会漏（漏了的表现
+    是 10001 INVALID_USER_KEY，看着像 key 坏了，其实是没传）。
+    """
+    import time
+
+    import requests
+
+    for attempt in range(_AMAP_RETRY_TIMES):
+        try:
+            resp = requests.get(
+                f"{AMAP_BASE}{path}",
+                params={**params, "key": api_key},
+                timeout=20,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:                   # noqa: BLE001 —— 工具层不抛异常
+            return {}, f"调用高德失败：{type(exc).__name__}: {exc}"
+
+        if data.get("status") == "1":
+            return data, ""
+
+        code = str(data.get("infocode", ""))
+        # 只有「太快了」值得重试；key 错了、配额用完了，重试一万次也一样
+        if code in _AMAP_RETRY_INFOCODES and attempt < _AMAP_RETRY_TIMES - 1:
+            time.sleep(_AMAP_RETRY_WAIT_SEC)
+            continue
+        return {}, _AMAP_ERRORS.get(code, f"高德返回 {data.get('info')}（infocode {code}）")
+
+    return {}, "高德连续多次 QPS 超限，请稍后再试"
+
+
+def _amap_location(place: str, city: str, api_key: str) -> tuple[str, str]:
+    """把地名换成「经度,纬度」。已经是坐标的原样返回。返回 (坐标, 错误信息)。"""
+    # 模型有时直接给坐标，别浪费一次地理编码
+    parts = place.split(",")
+    if len(parts) == 2 and all(p.strip().replace(".", "", 1).lstrip("-").isdigit() for p in parts):
+        return place.strip(), ""
+
+    params = {"address": place}
+    if city:
+        params["city"] = city
+    data, err = _amap_get("/geocode/geo", params, api_key)
+    if err:
+        return "", err
+
+    geocodes = data.get("geocodes") or []
+    if not geocodes:
+        hint = "" if city else "。加上 city 参数指定城市能提高命中率"
+        return "", f"高德找不到「{place}」这个地方{hint}"
+    return geocodes[0].get("location", ""), ""
+
+
+def taxi_fare(arguments: str) -> str:
+    """算两地之间开车要多久、多远，以及打车大概多少钱。
+
+    搜索引擎只能给你当地的运价表，给不了「从 A 到 B 具体多少钱」——那要按实际
+    路线算。这个工具算得出来，市内交通的花费该用它。
+
+    注意：金额是高德按通用计价模型估的，不套用当地运价文件。有回空补贴、
+    夜间加价的城市，长途会偏低——报的时候要带上「高德估算」这几个字。
+
+    Args:
+        arguments: JSON 字符串，必填 from 与 to（地名，或「经度,纬度」），
+                   可选 city 用于消歧。例如
+                   {"from": "诸暨站", "to": "五泄风景区", "city": "诸暨"}
+    """
+    import json
+
+    # 先校参数、后查 key：参数写错是模型自己能改的错，应该优先报出来；
+    # 顺带让自测能在没有高德 key 的机器上离线测这两条守卫（见 main.py 第 [3] 节）。
+    try:
+        args = json.loads(arguments)
+    except json.JSONDecodeError as exc:
+        return f'参数不是合法 JSON：{exc}。应形如 {{"from":"诸暨站","to":"五泄风景区","city":"诸暨"}}'
+    if not isinstance(args, dict):
+        return '参数应是一个 JSON 对象，形如 {"from":"诸暨站","to":"五泄风景区","city":"诸暨"}'
+
+    origin_name = str(args.get("from", "")).strip()
+    dest_name = str(args.get("to", "")).strip()
+    city = str(args.get("city", "")).strip()
+    if not origin_name or not dest_name:
+        return '缺少 from 或 to。应形如 {"from":"诸暨站","to":"五泄风景区","city":"诸暨"}'
+
+    api_key = load_key(ENV_AMAP)
+    if not api_key:
+        return "错误：未配置高德 key（环境变量 AMAP_API_KEY 或 keys.py）"
+
+    origin, err = _amap_location(origin_name, city, api_key)
+    if err:
+        return f"起点搞不定：{err}"
+    dest, err = _amap_location(dest_name, city, api_key)
+    if err:
+        return f"终点搞不定：{err}"
+
+    # 不传 strategy / extensions：实测这两个参数会触发 MISSING_REQUIRED_PARAMS，
+    # 而最简参数集返回的 route 里本来就带着 taxi_cost。
+    data, err = _amap_get(
+        "/direction/driving", {"origin": origin, "destination": dest}, api_key
+    )
+    if err:
+        return f"路线规划失败：{err}"
+
+    route = data.get("route") or {}
+    paths = route.get("paths") or []
+    if not paths:
+        return f"高德没给出「{origin_name}」到「{dest_name}」的驾车路线，可能太近或无法驾车抵达。"
+
+    path = paths[0]
+    distance_km = float(path.get("distance", 0)) / 1000
+    minutes = float(path.get("duration", 0)) / 60
+
+    lines = [
+        f"驾车：{origin_name} → {dest_name}",
+        f"距离 {distance_km:.1f} 公里，耗时约 {minutes:.0f} 分钟",
+    ]
+    taxi_cost = str(route.get("taxi_cost", "")).strip()
+    if taxi_cost and taxi_cost not in ("0", ""):
+        lines.append(f"打车约 {taxi_cost} 元（高德按通用计价模型估算，未套用当地运价文件，可能有出入）")
+    else:
+        lines.append("高德没有给出打车估价（距离过近时为 0），这一项按「待确认」处理")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 4. calculator —— 只挂给 critic
 # ---------------------------------------------------------------------------
 
 _ALLOWED_BINOPS: dict[type, Callable[[float, float], float]] = {
@@ -223,12 +386,13 @@ def _fmt(value: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 4. 注册表
+# 5. 注册表
 # ---------------------------------------------------------------------------
 
 ALL_TOOLS: dict[str, Callable[[str], str]] = {
     "search": search,
     "fetch_page": fetch_page,
+    "taxi_fare": taxi_fare,
     "calculator": calculator,
 }
 

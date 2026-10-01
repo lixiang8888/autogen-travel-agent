@@ -565,7 +565,7 @@ async def stage5_full(task: str, replies: list[str] | None = None, *, hooks=None
 
 def selftest() -> int:
     """验证接线是否正确。跑这个不需要 API key，也不会发起任何网络请求。"""
-    from tools import ALL_TOOLS, build_tools, calculator, fetch_page
+    from tools import ALL_TOOLS, _amap_location, build_tools, calculator, fetch_page, taxi_fare
 
     failures: list[str] = []
 
@@ -591,17 +591,29 @@ def selftest() -> int:
         check(f"拒绝 {bad[:28]!r}", got.startswith("计算失败"), f"实际：{got}")
 
     print("\n[3] 工具：挂载关系与 README「谁有什么工具」表一致")
-    # 联网的两把（search / fetch_page）必须都只挂在 researcher 身上——它们合起来才是
-    # 「唯一联网者」这一条权力，拆开挂给别人照样废掉拓扑（tools.py 文件头）。
-    check("researcher 挂 search + fetch_page", RESEARCHER.tool_names == ("search", "fetch_page"))
+    # 联网的三把（search / fetch_page / taxi_fare）必须都只挂在 researcher 身上——它们合起来
+    # 才是「唯一联网者」这一条权力，拆开挂给别人照样废掉拓扑（tools.py 文件头）。
+    check(
+        "researcher 挂三把联网工具",
+        RESEARCHER.tool_names == ("search", "fetch_page", "taxi_fare"),
+    )
     check("planner 一把都不挂", PLANNER.tool_names == ())
     check("critic 只挂 calculator", CRITIC.tool_names == ("calculator",))
     check("critic 有 handoff 通到 user", CRITIC.handoffs == ("user",))
-    check("ALL_TOOLS 正好三个", set(ALL_TOOLS) == {"search", "fetch_page", "calculator"})
+    check(
+        "ALL_TOOLS 正好四个",
+        set(ALL_TOOLS) == {"search", "fetch_page", "taxi_fare", "calculator"},
+    )
     check("build_tools 能取到 search", len(build_tools(["search"])) == 1)
-    # fetch_page 的入参守卫要在联网之前生效：模型经常把关键词当网址传进来。
-    # 传非网址时它走的是「提前 return」那条路，所以这一段不联网也能测。
+    # 下面两条是入参守卫，都要在联网之前生效，所以这一段不联网、也不需要高德 key。
+    # fetch_page：模型经常把搜索关键词当网址传进来。
     check("fetch_page 挡住非网址入参", fetch_page("成都大熊猫基地").startswith("错误："))
+    # taxi_fare：模型经常把 JSON 写坏，或者漏掉一半参数。
+    check("taxi_fare 挡住坏 JSON", taxi_fare("{不是 json").startswith("参数不是合法 JSON"))
+    check("taxi_fare 挡住缺 to", taxi_fare('{"from":"诸暨站"}').startswith("缺少 from 或 to"))
+    # 已经是坐标的入参不该再走一次地理编码（省一次配额，也避免地名消歧出错）
+    # （传空 key 是安全的：坐标那条路在用到 key 之前就返回了）
+    check("taxi_fare 认得坐标入参", _amap_location("120.18,29.72", "", "")[0] == "120.18,29.72")
     try:
         build_tools(["nope"])
         check("未登记的工具名会报错", False, "没报错")

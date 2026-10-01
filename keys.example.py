@@ -15,13 +15,26 @@ keys.example.py —— keys.py 的模板（本文件会提交，里面不含任�
 申请地址：
     DEEPSEEK_API_KEY  https://platform.deepseek.com/api_keys
     TAVILY_API_KEY    https://app.tavily.com/home
+    AMAP_API_KEY      https://console.amap.com/dev/key/app
 """
 
 # DeepSeek —— 跑三个 LLM agent（researcher / planner / critic）
 DEEPSEEK_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# Tavily —— search 工具的后端，只挂给 researcher
+# Tavily —— search 与 fetch_page 的后端，只挂给 researcher
 TAVILY_API_KEY = "tvly-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# 高德 —— taxi_fare 工具的后端（路径规划 + 地理编码），只挂给 researcher
+#
+# 申请时有两个地方容易选错，都会让 key 报出一堆看不懂的错：
+#   1. 服务平台必须选「Web服务」。选成 Android/iOS 的 key 调不了 restapi，
+#      报 INVALID_USER_KEY——看着像 key 坏了，其实是平台不对。
+#   2. IP 白名单留空。本项目跑在 WSL2 里，出口 IP 是 Windows 侧的动态地址，
+#      填了白名单过几天就会因 IP 变动而全部请求失败，且报错同样像 key 失效。
+#
+# 新 key 的 QPS 限制很紧，未认证时连调三四次就可能撞上「QPS 超限」。tools.py 里
+# 有退避重试兜着；想彻底解决就去做个人认证（顺带把月配额提到 15 万次）。
+AMAP_API_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 
 # ---------------------------------------------------------------------------

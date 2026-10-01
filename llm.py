@@ -36,6 +36,7 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "").strip() or DEFAULT_MODEL
 
 ENV_DEEPSEEK = "DEEPSEEK_API_KEY"
 ENV_TAVILY = "TAVILY_API_KEY"
+ENV_AMAP = "AMAP_API_KEY"
 
 
 # ---------------------------------------------------------------------------
