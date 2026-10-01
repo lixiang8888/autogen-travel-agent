@@ -24,7 +24,8 @@ DEEPSEEK_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # Tavily —— search 与 fetch_page 的后端，只挂给 researcher
 TAVILY_API_KEY = "tvly-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
-# 高德 —— taxi_fare 工具的后端（路径规划 + 地理编码），只挂给 researcher
+# 高德 —— taxi_fare（路径规划 + 地理编码）与 hotel_options（搜索 POI）的后端，
+# 两个都只挂给 researcher
 #
 # 申请时有两个地方容易选错，都会让 key 报出一堆看不懂的错：
 #   1. 服务平台必须选「Web服务」。选成 Android/iOS 的 key 调不了 restapi，

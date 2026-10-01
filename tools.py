@@ -3,19 +3,24 @@
 tools.py —— 工具：search + fetch_page（Tavily）、taxi_fare（高德）、calculator
 ================================================================================
 
-**四个工具，联网的三把都只挂给一个 agent**（划界判据：工具集不同，或信息视野不同）：
+**五个工具，联网的四把都只挂给一个 agent**（划界判据：工具集不同，或信息视野不同）：
 
-    search      → researcher，全队唯一联网者
-    fetch_page  → researcher，同上（搜到的摘要截断时读全文）
-    taxi_fare   → researcher，同上（两地之间的驾车距离/耗时/打车估价）
-    calculator  → critic，全队唯一算账者
+    search        → researcher，全队唯一联网者
+    fetch_page    → researcher，同上（搜到的摘要截断时读全文）
+    taxi_fare     → researcher，同上（两地之间的驾车距离/耗时/打车估价）
+    hotel_options → researcher，同上（按商圈+档位列酒店，不含房价）
+    calculator    → critic，全队唯一算账者
 
-researcher 那三把是**同一把权力的三个动作**：「搜得到」「读得全」「算得出路线」。
-它们是同一条信息视野的三个入口，所以一起挂给 researcher，不构成新的划界。
-挂到别人身上照样会废掉拓扑——理由同下。
+researcher 那四把是**同一把权力的四个动作**：「搜得到」「读得全」「算得出路线」
+「列得出候选」。它们是同一条信息视野的四个入口，所以一起挂给 researcher，不构成
+新的划界。挂到别人身上照样会废掉拓扑——理由同下。
 
 `taxi_fare` 为什么必须是个工具、而不是让 researcher 拿运价表自己乘：它要的
 **里程数**搜不出来，只能算。见 README「踩过的坑」第 11 条。
+
+`hotel_options` 为什么查的是**档位**而不是房价：酒店实价按日期和房型动态生成、
+且在登录墙后面，`fetch_page` 打开携程酒店页只拿得到一张登录表单。能查的只有
+「这一带有哪些连锁、哪家是哪一档」。见 README「踩过的坑」第 13 条。
 
 这个不对称是刻意的，不是省事：如果 planner 也能搜，它就会绕过 researcher 自己查，
 群聊立刻退化成三个各自为战的单 agent。所以「谁能用哪个工具」是这个拓扑的地基，
@@ -158,6 +163,10 @@ def fetch_page(url: str) -> str:
 
 AMAP_BASE = "https://restapi.amap.com/v3"
 
+#: 搜索 POI 2.0 在 v5 下，地理编码和路径规划还在 v3——高德的版本号不是统一的，
+#: 拿 v3 的基址去调 /place/text 会 404。分成两个常量，别合并。
+AMAP_POI_BASE = "https://restapi.amap.com/v5"
+
 #: 高德的错误码 → 人话。模型看不懂 INVALID_USER_KEY，但看得懂「key 没配」。
 #: 10009 单列出来，是因为它最容易误判：key 本身是好的，只是创建时服务平台
 #: 选成了 Android/iOS——那种 key 调不了 restapi，报错却像是 key 坏了。
@@ -183,7 +192,9 @@ _AMAP_RETRY_TIMES = 3
 _AMAP_RETRY_WAIT_SEC = 1.2
 
 
-def _amap_get(path: str, params: dict[str, str], api_key: str) -> tuple[dict, str]:
+def _amap_get(
+    path: str, params: dict[str, str], api_key: str, base: str = AMAP_BASE
+) -> tuple[dict, str]:
     """调一次高德 Web 服务。返回 (数据, 错误信息)。错误信息为空串表示成功。
 
     key 在这里统一注入——每个高德接口都要它，散在各调用点上一定会漏（漏了的表现
@@ -196,7 +207,7 @@ def _amap_get(path: str, params: dict[str, str], api_key: str) -> tuple[dict, st
     for attempt in range(_AMAP_RETRY_TIMES):
         try:
             resp = requests.get(
-                f"{AMAP_BASE}{path}",
+                f"{base}{path}",
                 params={**params, "key": api_key},
                 timeout=20,
             )
@@ -311,7 +322,88 @@ def taxi_fare(arguments: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 4. calculator —— 只挂给 critic
+# 4. hotel_options —— 只挂给 researcher
+# ---------------------------------------------------------------------------
+
+#: 按商圈+档位搜酒店时返回几条。命中数常有三四十家，全灌进群聊没有意义——
+#: researcher 要的是「这一带有哪些连锁、什么档位」，看前几条足够。
+POI_MAX_RESULTS = 8
+
+#: 住宿服务的 POI 类型码。不限定的话，搜「春熙路 快捷酒店」会把餐馆也带回来。
+POI_TYPE_LODGING = "100000"
+
+
+def hotel_options(arguments: str) -> str:
+    """按商圈和档位列出酒店，给出店名、所属区、档位分类与评分。
+
+    用它回答「这一带有什么酒店、哪家是哪一档」。**它不返回房价**：酒店实价按日期和
+    房型动态生成、且在登录墙后面，任何接口都查不到。价格靠用户拍板，或者按搜索到的
+    商圈价位区间给——别指望这个工具。
+
+    Args:
+        arguments: JSON 字符串，必填 city，另需 keywords（商圈/地名 + 档位词）。
+                   例如 {"city": "成都", "keywords": "春熙路 快捷酒店"}
+                   档位词可用：快捷酒店 / 经济型 / 商务酒店 / 舒适型 / 高档型 / 民宿
+    """
+    import json
+
+    # 先校参数、后查 key，理由同 taxi_fare（自测要能在没有 key 的机器上离线测守卫）
+    try:
+        args = json.loads(arguments)
+    except json.JSONDecodeError as exc:
+        return f'参数不是合法 JSON：{exc}。应形如 {{"city":"成都","keywords":"春熙路 快捷酒店"}}'
+    if not isinstance(args, dict):
+        return '参数应是一个 JSON 对象，形如 {"city":"成都","keywords":"春熙路 快捷酒店"}'
+
+    city = str(args.get("city", "")).strip()
+    keywords = str(args.get("keywords", "")).strip()
+    if not city or not keywords:
+        return '缺少 city 或 keywords。应形如 {"city":"成都","keywords":"春熙路 快捷酒店"}'
+
+    api_key = load_key(ENV_AMAP)
+    if not api_key:
+        return "错误：未配置高德 key（环境变量 AMAP_API_KEY 或 keys.py）"
+
+    data, err = _amap_get(
+        "/place/text",
+        {
+            "keywords": keywords,
+            "region": city,
+            "city_limit": "true",
+            "types": POI_TYPE_LODGING,
+            "page_size": str(POI_MAX_RESULTS),
+            "show_fields": "business",
+        },
+        api_key,
+        base=AMAP_POI_BASE,
+    )
+    if err:
+        return f"搜酒店失败：{err}"
+
+    pois = data.get("pois") or []
+    if not pois:
+        return f"高德在「{city} {keywords}」没搜到住宿，换个商圈名或去掉档位词再试。"
+
+    # 不报 count：v5 的 count 就是本次返回条数（被 page_size 截断），不是命中总数。
+    # 报成「命中 N 家」会让模型以为这一带只有 N 家。
+    lines = [f"{city} {keywords}：列出 {len(pois)} 家（高德按相关度排序，可能还有更多）"]
+    for i, poi in enumerate(pois, 1):
+        biz = poi.get("business") or {}
+        tier = biz.get("keytag") or poi.get("type", "").split(";")[-1] or "档位未标"
+        rating = biz.get("rating") or "无评分"
+        address = poi.get("address") or ""
+        # address 有时是 "锦江区xxx" 这种带区名的形式，为空的就退回行政区
+        where = address if isinstance(address, str) and address.strip() else poi.get("adname", "")
+        lines.append(
+            f"{i}. {poi.get('name', '(无名)')}｜{poi.get('adname', '')}｜{tier}｜{rating} 分\n"
+            f"   {where}"
+        )
+    lines.append("以上只有档位和位置，**没有房价**——酒店实价查不到，价格要用户拍板或按商圈区间估。")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 5. calculator —— 只挂给 critic
 # ---------------------------------------------------------------------------
 
 _ALLOWED_BINOPS: dict[type, Callable[[float, float], float]] = {
@@ -386,13 +478,14 @@ def _fmt(value: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 5. 注册表
+# 6. 注册表
 # ---------------------------------------------------------------------------
 
 ALL_TOOLS: dict[str, Callable[[str], str]] = {
     "search": search,
     "fetch_page": fetch_page,
     "taxi_fare": taxi_fare,
+    "hotel_options": hotel_options,
     "calculator": calculator,
 }
 
