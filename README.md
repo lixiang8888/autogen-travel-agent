@@ -80,7 +80,7 @@ python launcher.py --demo     # 离线假数据：不用 key、不联网，几�
 
 | Agent | 工具 | 独有的权力 |
 | --- | --- | --- |
-| `researcher` | `search` | 全队唯一能联网 |
+| `researcher` | `search` + `fetch_page` | 全队唯一能联网 |
 | `planner` | 无 | —— |
 | `critic` | `calculator` + handoff | 唯一能算账、唯一持对抗立场 |
 | `user`（你） | 无 | 需求与拍板权 |
@@ -113,7 +113,7 @@ APPROVED」）就会提前终止，把没审完的行程当通过交付。见「
 README.md            本文件：定位、用法、改哪里、踩过的坑
 docs/agents/         四个 agent 的说明书：角色、边界、产出契约
 llm.py               DeepSeek 客户端（AutoGen 的 OpenAIChatCompletionClient）
-tools.py             search(Tavily) + calculator + 注册表
+tools.py             search + fetch_page(Tavily) + calculator + 注册表
 persona.py           三个 LLM agent 的人格（角色 prompt + 格式契约）
 main.py              组队、终止条件、入口、离线自测
 launcher.py          网页启动器（可选：删掉它 --selftest 照样绿）
@@ -195,6 +195,21 @@ system_message = 角色 prompt + "\n\n" + 格式契约
    显式给系统解释器路径即可绕开。PyPI 直连通常正常。
 8. **`--reply` 用完会挂死。** 早期实现用完回退到 `input()`，而管道场景下 stdin 可能是
    「开着但不给数据」——不抛 `EOFError` 而是永久阻塞，最后被 timeout 杀掉。已改为用完即停。
+9. **搜索摘要会比正文早一步「结束」，而缺的那截恰好是价目表。** 起因是「门票、打车钱
+   老是查不到」。实测同一条 `诸暨 出租车 起步价`，`basic` 深度确实命中了正确的
+   《运价调整通知》，但摘要**正好断在「有关事项的通知」后面**——数字全在被截掉的部分。
+   `诸暨 景点 门票价格` 更差：`basic` 返回的 5 条里一条真票价都没有（全是攻略聚合页和
+   一日游产品），`advanced` 能带出 4 个具体票价。**改法**：深度提到 `advanced`，并加
+   `fetch_page`（Tavily Extract）让 researcher 在「搜到了链接但没看见数字」时读全文。
+   **剩余边界**：政府公告常把价目表做成图片（潮新闻那篇里就有一张 png），提取不到正文——
+   这种只能换来源，任何爬虫都无解。
+10. **契约自己在教模型编数字。** 格式契约的示例原本写着
+   `【市内】地铁+打车 日均约50/人（来源：https://...）`——「日均 50」**没有对应的现实
+   数据源**，模型只能自己折算。要命的是它带着「（来源：URL）」，`critic` 的幻觉比对
+   （拿行程回查清单）**查不出这种编造**：清单里确实写着 50。于是「查不到打车钱」这个
+   缺口被一个自算的日均值盖住，交付出去的是**假的确定性**。**改法**：契约改成照抄原始
+   口径（费率、票种、免票条件），`planner` 的判据从「素材里有没有数字」收紧成「能不能
+   直接算成这一项的总额」。缺口从此显形为「待确认」，而不是被抹平。
 
 ### 设计取舍
 

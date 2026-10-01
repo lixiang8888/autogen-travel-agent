@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-tools.py —— 工具：search（Tavily）+ calculator
-================================================
+tools.py —— 工具：search + fetch_page（Tavily）+ calculator
+=============================================================
 
-**只有两个工具，且各只挂给一个 agent**（划界判据：工具集不同，或信息视野不同）：
+**只有三个工具，联网的两把都只挂给一个 agent**（划界判据：工具集不同，或信息视野不同）：
 
     search      → researcher，全队唯一联网者
+    fetch_page  → researcher，同上（搜到的摘要截断时读全文）
     calculator  → critic，全队唯一算账者
+
+`search` 和 `fetch_page` 是**同一把权力的两个动作**（「查得到」和「读得全」），所以
+一起挂给 researcher，不构成新的划界。挂到别人身上照样会废掉拓扑——理由同下。
 
 这个不对称是刻意的，不是省事：如果 planner 也能搜，它就会绕过 researcher 自己查，
 群聊立刻退化成三个各自为战的单 agent。所以「谁能用哪个工具」是这个拓扑的地基，
@@ -32,6 +36,16 @@ from llm import ENV_TAVILY, load_key
 TAVILY_BASE = "https://api.tavily.com"
 TAVILY_MAX_RESULTS = 5
 
+#: 搜索深度。**别退回 "basic"**：实测同一条「诸暨 景点 门票价格」，basic 返回的 5 条
+#: 里没有一条带票价（全是攻略聚合页和一日游产品），advanced 能带出 4 个具体票价。
+#: 代价见 README「踩过的坑」第 9 条。
+TAVILY_SEARCH_DEPTH = "advanced"
+
+#: fetch_page 单页正文的字符上限。Tavily 的 advanced 提取一页常有两三千字，而
+#: researcher 一轮要抓好几次，全文灌进群聊会顶爆上下文（README「设计取舍」承认
+#: 上下文膨胀是既定代价，但没理由主动加码）。超长就截断，并在文末说明截过。
+FETCH_MAX_CHARS = 4000
+
 
 # ---------------------------------------------------------------------------
 # 1. search —— 只挂给 researcher
@@ -42,6 +56,8 @@ def search(query: str) -> str:
 
     用于查询实时或你知识之外的信息：交通班次与票价、酒店价位、景点门票、
     开放时间等。搜不到时换一个更具体的关键词再试。
+
+    摘要常常在关键处被截断——拿到链接但没拿到数字时，用 fetch_page 打开那一条读全文。
 
     Args:
         query: 搜索关键词，例如 "成都大熊猫基地 门票价格 2026"
@@ -58,10 +74,10 @@ def search(query: str) -> str:
             json={
                 "api_key": api_key,
                 "query": query,
-                "search_depth": "basic",
+                "search_depth": TAVILY_SEARCH_DEPTH,
                 "max_results": TAVILY_MAX_RESULTS,
             },
-            timeout=30,
+            timeout=60,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -83,7 +99,56 @@ def search(query: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 2. calculator —— 只挂给 critic
+# 2. fetch_page —— 只挂给 researcher
+# ---------------------------------------------------------------------------
+
+def fetch_page(url: str) -> str:
+    """打开一个网页，返回正文全文。
+
+    搜索摘要经常在价目表、班次表前面被截断——摘要里能看到「运价调整有关事项的
+    通知」，但看不到通知里的数字。这时用这个工具把那一页读全。
+
+    Args:
+        url: 完整网址，从 search 结果的「来源：」后面整条复制
+    """
+    api_key = load_key(ENV_TAVILY)
+    if not api_key:
+        return "错误：未配置 Tavily API key（环境变量 TAVILY_API_KEY 或 keys.py）"
+
+    url = url.strip()
+    if not url.startswith(("http://", "https://")):
+        return f"错误：{url!r} 不是完整网址。请从 search 结果的「来源：」处整条复制。"
+
+    import requests
+
+    try:
+        resp = requests.post(
+            f"{TAVILY_BASE}/extract",
+            json={"api_key": api_key, "urls": [url], "extract_depth": "advanced"},
+            timeout=90,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:                       # noqa: BLE001 —— 工具层不抛异常
+        return f"打开网页失败：{type(exc).__name__}: {exc}。可以换一个来源再试。"
+
+    results = data.get("results") or []
+    if not results:
+        failed = data.get("failed_results") or []
+        reason = failed[0].get("error", "无法提取正文") if failed else "没有返回内容"
+        return f"这个网页打不开：{reason}。换一个来源再试。"
+
+    content = (results[0].get("raw_content") or "").strip()
+    if not content:
+        return "这个网页没有可提取的正文（可能是纯图片或脚本渲染的页面），换一个来源再试。"
+
+    if len(content) > FETCH_MAX_CHARS:
+        content = content[:FETCH_MAX_CHARS] + f"\n…（正文过长，已截断到前 {FETCH_MAX_CHARS} 字符）"
+    return f"{url}\n\n{content}"
+
+
+# ---------------------------------------------------------------------------
+# 3. calculator —— 只挂给 critic
 # ---------------------------------------------------------------------------
 
 _ALLOWED_BINOPS: dict[type, Callable[[float, float], float]] = {
@@ -158,11 +223,12 @@ def _fmt(value: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 3. 注册表
+# 4. 注册表
 # ---------------------------------------------------------------------------
 
 ALL_TOOLS: dict[str, Callable[[str], str]] = {
     "search": search,
+    "fetch_page": fetch_page,
     "calculator": calculator,
 }
 

@@ -565,7 +565,7 @@ async def stage5_full(task: str, replies: list[str] | None = None, *, hooks=None
 
 def selftest() -> int:
     """验证接线是否正确。跑这个不需要 API key，也不会发起任何网络请求。"""
-    from tools import ALL_TOOLS, calculator, build_tools
+    from tools import ALL_TOOLS, build_tools, calculator, fetch_page
 
     failures: list[str] = []
 
@@ -591,12 +591,17 @@ def selftest() -> int:
         check(f"拒绝 {bad[:28]!r}", got.startswith("计算失败"), f"实际：{got}")
 
     print("\n[3] 工具：挂载关系与 README「谁有什么工具」表一致")
-    check("researcher 只挂 search", RESEARCHER.tool_names == ("search",))
+    # 联网的两把（search / fetch_page）必须都只挂在 researcher 身上——它们合起来才是
+    # 「唯一联网者」这一条权力，拆开挂给别人照样废掉拓扑（tools.py 文件头）。
+    check("researcher 挂 search + fetch_page", RESEARCHER.tool_names == ("search", "fetch_page"))
     check("planner 一把都不挂", PLANNER.tool_names == ())
     check("critic 只挂 calculator", CRITIC.tool_names == ("calculator",))
     check("critic 有 handoff 通到 user", CRITIC.handoffs == ("user",))
-    check("ALL_TOOLS 正好两个", set(ALL_TOOLS) == {"search", "calculator"})
+    check("ALL_TOOLS 正好三个", set(ALL_TOOLS) == {"search", "fetch_page", "calculator"})
     check("build_tools 能取到 search", len(build_tools(["search"])) == 1)
+    # fetch_page 的入参守卫要在联网之前生效：模型经常把关键词当网址传进来。
+    # 传非网址时它走的是「提前 return」那条路，所以这一段不联网也能测。
+    check("fetch_page 挡住非网址入参", fetch_page("成都大熊猫基地").startswith("错误："))
     try:
         build_tools(["nope"])
         check("未登记的工具名会报错", False, "没报错")
