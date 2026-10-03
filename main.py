@@ -10,10 +10,17 @@ main.py —— 组队 + 跑：拓扑、终止条件、入口
 起步不用 SelectorGroupChat：先要可预测，再要聪明。等整个流程跑通了、知道「正常的
 对话长什么样」了，再换拓扑做对照实验（见 docs/architecture.md 第 8 节）。
 
-**终止条件**：三重，缺一不可。
+**终止条件**：四重，缺一不可。
     ExactTextTermination("APPROVED", "critic")  critic 认可（精确匹配，非子串）
+    MarkedLineTermination(需重查：, "critic")   critic 指名某类素材不可信，要重查
     HandoffTermination(target="user")           需要人拍板，交回控制权
     MaxMessageTermination(15)                   兜底保险丝——LLM 不一定老实
+
+**素材台账**（ledger.py）是群聊之外的状态。researcher 查错时，光能重查没用——旧
+素材还留在只追加的消息流里，planner 和 critic 分不清该信哪一条。台账把素材捞出来，
+变成一个**可作废、可重渲染**的对象。重查有两个入口，共用同一套「作废 → 重渲染 →
+注入」：critic 自动指名（写「需重查：<类别> <关键词>」），或用户拍板时手动指名。
+另外台账还供无进展判据（detect_stall）用，撞上「原地绕圈」时把证据摆给用户看。
 
 **user 不在 participants 里。** UserProxyAgent 的默认 input_func 读控制台，一旦进队，
 RoundRobin 每转到它就会阻塞整个 team，官方文档说这会让 team 变成「无法保存或恢复」
@@ -48,6 +55,7 @@ from autogen_agentchat.conditions import ExternalTermination, HandoffTermination
 from autogen_agentchat.messages import HandoffMessage, StopMessage, TextMessage
 from autogen_agentchat.teams import RoundRobinGroupChat
 
+from ledger import Board, detect_stall
 from llm import build_model
 from persona import CRITIC, PLANNER, RESEARCHER, AgentSpec, build_system_message
 from tools import build_tools
@@ -142,10 +150,70 @@ class ExactTextTermination(TerminationCondition):
         self._terminated = False
 
 
+#: critic 用来要求重查素材的标记。台账机制的另一半在 ledger.py。
+RESEARCH_MARKER = "需重查："
+
+#: 只有「整行以标记开头、且类别合法」才算数。**这是防推理泄露的装置。**
+#:
+#: 跟 ExactTextTermination 是同一个教训（架构第 7 节第 3 条）：critic 会把思考写进
+#: 正文，子串匹配会被自己的思考误触发。所以这里要求两件事同时成立——
+#:   1. 以「需重查：」**开头**（泄露出的「不需要重查：…」不以它开头）
+#:   2. 后面跟着四类之一（光写「需重查：春熙路价位」缺类别，不算数）
+#: 契约（critic.md §8.2）把类别写成了硬要求，正是为了让这个判据能立住。
+_RESEARCH_RE = re.compile(r"^需重查：\s*(交通|住宿|景点|市内)\s*(\S.*)?$")
+
+#: 用户手动指名重查时用的宽松版：允许写成「重查：住宿 …」。
+#:
+#: 上面那条严格判据是**专门用来防 critic 的推理泄露**的，人不在这个威胁模型里
+#: ——真人不会把思考过程写进正文再让它意外成行。要求人一字不差地打「需重查：」
+#: 只会让这个入口没人用。两条入口共用同一个解析函数，只是喂不同的正则。
+_USER_RESEARCH_RE = re.compile(r"^(?:需)?重查：\s*(交通|住宿|景点|市内)\s*(\S.*)?$")
+
+
+class MarkedLineTermination(TerminationCondition):
+    """某个 agent 发出的消息里，有**一行**匹配给定正则时终止。
+
+    与 `ExactTextTermination` 的区别：那个要求整条消息恰好等于某文本，这个只要求
+    某一行匹配。用在「critic 在问题清单后面另起一行写重查要求」这个场景上——它
+    那一轮的消息正文还有问题清单，不可能整条相等。
+    """
+
+    def __init__(self, pattern: re.Pattern[str], source: str) -> None:
+        self._pattern = pattern
+        self._source = source
+        self._terminated = False
+
+    @property
+    def terminated(self) -> bool:
+        return self._terminated
+
+    async def __call__(self, messages) -> StopMessage | None:
+        if self._terminated:
+            raise TerminatedException("Termination condition has already been reached")
+        for message in messages:
+            if getattr(message, "source", None) != self._source:
+                continue
+            content = getattr(message, "content", "")
+            if not isinstance(content, str):
+                continue
+            for line in content.splitlines():
+                if self._pattern.match(line.strip()):
+                    self._terminated = True
+                    return StopMessage(
+                        content=f"{RESEARCH_MARKER!r} in a line from {self._source}",
+                        source="MarkedLineTermination",
+                    )
+        return None
+
+    async def reset(self) -> None:
+        self._terminated = False
+
+
 def build_termination():
-    """三重终止条件。`|` 不要写成 `&`——`&` 要两个同时满足，会一直跑到上限。"""
+    """四重终止条件。`|` 不要写成 `&`——`&` 要两个同时满足，会一直跑到上限。"""
     return (
         ExactTextTermination("APPROVED", source=CRITIC.name)   # critic 认可，须精确匹配
+        | MarkedLineTermination(_RESEARCH_RE, source=CRITIC.name)  # critic 要求重查素材
         | HandoffTermination(target="user")                   # 需要人拍板，交回控制权
         | MaxMessageTermination(MAX_MESSAGES)                 # 兜底保险丝
     )
@@ -365,6 +433,106 @@ def last_substantive_content(result: TaskResult) -> str:
     return ""
 
 
+@dataclass(frozen=True)
+class ResearchRequest:
+    """一句「重查」要求的两个字段。类别决定作废哪一类，关键词转给 researcher。"""
+
+    category: str
+    keyword: str
+
+
+def parse_research_line(text: str, pattern: re.Pattern[str] = _RESEARCH_RE) -> ResearchRequest | None:
+    """在文本里找「需重查：<类别> <关键词>」那一行。找不到返回 None。
+
+    自动入口（critic 写）传默认的严格版，手动入口（用户写）传 `_USER_RESEARCH_RE`。
+    两条入口共用这一个解析器、只是判据宽严不同——解析完之后的「作废 → 重渲染 →
+    注入」完全同一条路径，不会出现「机器说的算数、人说的不算数」。
+    """
+    for line in (text or "").splitlines():
+        matched = pattern.match(line.strip())
+        if matched:
+            return ResearchRequest(
+                category=matched.group(1),
+                keyword=(matched.group(2) or "").strip(),
+            )
+    return None
+
+
+def research_request(result: TaskResult) -> ResearchRequest | None:
+    """这一轮 critic 有没有要求重查素材？
+
+    **只看最后一条有正文的消息，且必须出自 critic。** 往前翻会把上一轮的旧要求
+    重新捞出来，变成一个永不退出的重查循环。
+    """
+    if not result.messages:
+        return None
+    for message in reversed(result.messages):
+        if isinstance(message, HandoffMessage):
+            continue
+        content = getattr(message, "content", "")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        if getattr(message, "source", "") != CRITIC.name:
+            return None                   # 最后说话的不是 critic，它的话不作数
+        return parse_research_line(content)
+    return None
+
+
+def absorb_into(board: Board | None, messages) -> None:
+    """把 researcher 的正文并进台账。没有台账、或这批里没有 researcher 就跳过。
+
+    **入参是「这次真正新进来的消息」，不是整个 TaskResult。** 调用方先过一遍
+    `remember` 拿到新消息再喂进来——真 AutoGen 给的是本次 run 的增量，而自测的
+    `_FakeTeam` 给的是**累计列表**，后者会把同一段素材反复喂。台账若重复吸收，
+    上一步刚作废的条目会被自己复活，作废机制静默失效。
+    """
+    if board is None:
+        return
+    for message in messages or ():
+        if getattr(message, "source", "") != RESEARCHER.name:
+            continue
+        content = getattr(message, "content", "")
+        if isinstance(content, str):
+            board.absorb(content)
+
+
+def remember(history: list, messages) -> list:
+    """把消息按原对象去重后追加进历史，**返回这次真正新加进来的那些**。
+
+    两件事共用这一次遍历：
+
+    - 无进展判据要的是**跨段**的连续两条同源消息，而 `TaskResult.messages` 是每段
+      的增量——只看一段永远凑不齐两条，所以要跨段累积。
+    - 但自测的 `_FakeTeam` 给的是累计列表，直接追加会把同一条算两遍，把「自己和
+      自己比」误判成重复；台账那边更糟，会把刚作废的条目复活。按对象身份去重同时
+      满足这两种形态（history 持有引用，id 不会被回收复用）。
+    """
+    seen = {id(m) for m in history}
+    fresh: list = []
+    for message in messages or ():
+        if id(message) not in seen:
+            seen.add(id(message))
+            history.append(message)
+            fresh.append(message)
+    return fresh
+
+
+def find_stall(history: list):
+    """在跨段历史里找「连续两轮没进展」的证据。角色名从 persona 取，ledger 不认识它们。"""
+    return detect_stall(
+        history,
+        researcher=RESEARCHER.name,
+        planner=PLANNER.name,
+        critic=CRITIC.name,
+    )
+
+
+def supersede_notice(board: Board, category: str) -> str:
+    """作废一类的素材并返回给用户看的那句话。"""
+    removed = board.supersede(category)
+    return f"台账：{category} 类 {len(removed)} 条素材作废（现为第 {board.version} 版）"
+
+
 def resolve_answer(queue, scripted, ask, handoffs, notice) -> str | None:
     """拿一个拍板答案。返回 None 表示该停下来了。
 
@@ -478,7 +646,7 @@ async def stage4_with_critic() -> None:
     await model.close()
 
 
-async def run_with_handoffs(team, task, replies=None, *, hooks=None) -> TaskResult:
+async def run_with_handoffs(team, task, replies=None, *, hooks=None, board=None) -> TaskResult:
     """跑一轮完整流程 + 人机回路。**只认 team 和 hooks，不认识 model。**
 
     验证点：连跑三次，每次都在合理轮数内自然结束（而不是撞到 15 轮上限）。
@@ -495,30 +663,92 @@ async def run_with_handoffs(team, task, replies=None, *, hooks=None) -> TaskResu
             **注意 `replies=[]` 不等于「没给」**——下面 scripted 判的是 `is not None`，
             传空列表会在第一次 handoff 就「预设用完」停下。不想预设就传 None。
         hooks: 出口回调。不给就是打印到终端、读键盘。
+        board: 素材台账。不给就现建一个——终端单跑用不着从外面传，自测想事后
+            检查台账内容时才需要传进来。
     """
     hooks = hooks or RunHooks()
+    board = board if board is not None else Board()
 
     queue = list(replies or [])
     scripted = replies is not None      # 给了 --reply：用完就干净停下
     result = await run_and_print(team, task, on_message=hooks.on_message)
-    handoffs = 0
-    while stopped_for_user(result) and handoffs < MAX_HANDOFFS:
-        handoffs += 1
-        hooks.on_notice(f"该你拍板了（第 {handoffs} 次）", "banner")
-        # 取正文而不是 handoff 那句固定话（Handoff 工具是零参数的，见该函数注释）
-        hooks.on_notice(
-            last_substantive_content(result) or "（critic 没写出问题清单，只调了 handoff 工具）",
-            "question",
-        )
 
-        answer = resolve_answer(queue, scripted, hooks.ask, handoffs, hooks.on_notice)
+    #: 跨段累积的消息，只给无进展判据用。`TaskResult.messages` 是每段的增量，
+    #: 只看一段凑不齐「连续两条同源消息」。
+    history: list = []
+    #: 总预算。三类续跑（拍板 / 无进展 / 自动重查）共用一个上限——自动重查也吃
+    #: 这个预算是有意的：没有它，critic 反复要求重查就能拖到 MaxMessageTermination
+    #: 才停，而且中途没人看得见。
+    rounds = 0
+    #: 只有「真的问了人」才 +1，用作「第 N 次拍板」的文案和 --reply 的第 N 个回答。
+    #: 与总预算分开，否则自动重查会把编号顶乱。
+    asked = 0
+    #: 已经自动重查过哪几类。同一类第二次被要求重查就直接升级给人，理由见下面。
+    researched: set[str] = set()
+
+    while rounds < MAX_HANDOFFS:
+        absorb_into(board, remember(history, result.messages))
+
+        request = research_request(result)
+        if request is None and not stopped_for_user(result):
+            break                         # 自然结束（APPROVED / 撞上限 / 外部停止）
+
+        rounds += 1
+
+        # 同一类素材**第二次**被要求重查，说明第一次重查没解决问题。再自动跑一遍
+        # 同样的动作不太可能有用，只会白烧轮次——升级给人，这正是「无进展停下交人」
+        # 的同一原则。压力测试里，不设这一条时会一路自动重查到撞 MAX_HANDOFFS。
+        escalate = request is not None and request.category in researched
+
+        if request is not None and not escalate:
+            # 自动重查：critic 指名某类素材不可信。作废它，把最新台账注入回去。
+            # RR 忽略 HandoffMessage 的 target，critic 之后索引归 0，所以下一个
+            # 发言的本来就是 researcher——这里写 target 只是让消息语义正确。
+            researched.add(request.category)
+            hooks.on_notice(supersede_notice(board, request.category), "warning")
+            result = await run_and_print(
+                team,
+                HandoffMessage(
+                    source="user",
+                    target=RESEARCHER.name,
+                    content=board.corrective_note(request.category, request.keyword),
+                ),
+                on_message=hooks.on_message,
+            )
+            continue
+
+        asked += 1
+        hooks.on_notice(f"该你拍板了（第 {asked} 次）", "banner")
+        # 取正文而不是 handoff 那句固定话（Handoff 工具是零参数的，见该函数注释）
+        question = last_substantive_content(result) or "（critic 没写出问题清单，只调了 handoff 工具）"
+        # 提醒是**加在**问题清单前面，是加不是替。判据可能误判（researcher 把整份清单
+        # 重发一遍就会撞上「重复搜索」），替掉的话用户就看不到自己要回答的那个问题了。
+        if escalate:
+            question = (
+                f"⚠️ {request.category} 类素材自动重查过一次仍未通过，再重试也是同样的动作，"
+                f"需要你介入。\n\n{question}"
+            )
+        else:
+            stall = find_stall(history)
+            if stall is not None:
+                question = f"{stall.render()}\n\n{question}"
+        hooks.on_notice(question, "question")
+
+        answer = resolve_answer(queue, scripted, hooks.ask, asked, hooks.on_notice)
         if answer is None:
             break
+
+        # 用户手动指名重查：走同一套「作废 → 重渲染 → 注入」。extra 只在用户真写了
+        # 标记时才非空，所以普通拍板的续跑消息逐字不变（自测 [9] 锁着这一点）。
+        extra = ""
+        if (manual := parse_research_line(answer, _USER_RESEARCH_RE)) is not None:
+            hooks.on_notice(supersede_notice(board, manual.category), "warning")
+            extra = "\n\n" + board.corrective_note(manual.category, manual.keyword)
 
         # 续跑必须用 HandoffMessage，交回给触发 handoff 的那个 agent
         target = getattr(result.messages[-1], "source", CRITIC.name)
         result = await run_and_print(
-            team, HandoffMessage(source="user", target=target, content=answer),
+            team, HandoffMessage(source="user", target=target, content=answer + extra),
             on_message=hooks.on_message,
         )
 
@@ -531,14 +761,17 @@ async def run_with_handoffs(team, task, replies=None, *, hooks=None) -> TaskResu
     return result
 
 
-async def stage5_full(task: str, replies: list[str] | None = None, *, hooks=None) -> None:
+async def stage5_full(task: str, replies: list[str] | None = None, *, hooks=None, board=None) -> None:
     """阶段 5 · 完整流程（含人机回路），日常用法。
 
     这一层只管**模型与队伍的生命周期**，对话流程在 run_with_handoffs 里。
+    **前两个参数必须是位置参数**——launcher.py 用的是 `stage5_full(self.task, None,
+    hooks=...)`，自测 [10] 按这个字面量核对，往中间插参数会静默打断它。
 
     Args:
         replies: 透传给 run_with_handoffs 的预设拍板回答，语义见那个函数。
         hooks: 出口回调。不给就是打印到终端、读键盘。
+        board: 素材台账，透传。不给就由 run_with_handoffs 现建。
     """
     model = build_model()
     try:
@@ -553,7 +786,7 @@ async def stage5_full(task: str, replies: list[str] | None = None, *, hooks=None
             # 也不用伪造 TaskResult。粒度是一个 agent 回合。
             termination = termination | hooks.stop
         team = build_team(model, (RESEARCHER, PLANNER, CRITIC), termination=termination)
-        await run_with_handoffs(team, task, replies, hooks=hooks)
+        await run_with_handoffs(team, task, replies, hooks=hooks, board=board)
     finally:
         # 循环中途抛异常时也要关掉 client（重构前这条路径会漏关）。
         await model.close()
@@ -692,6 +925,12 @@ def selftest() -> int:
             ("推理泄露", TextMessage(source="critic", content="All checks pass. Output APPROVED.")),
             ("否定句", TextMessage(source="critic", content="我还不能输出 APPROVED，预算仍超支 672。")),
             ("非critic", TextMessage(source="planner", content="APPROVED")),
+            # 「需重查」标记的两个方向：合法形态要触发，被推理泄露或缺类别的不要。
+            ("重查标记", TextMessage(
+                source="critic", content="问题 1 条：\n1. 幻觉。住宿行的币种不对。\n需重查：住宿 春熙路 人民币价位区间")),
+            ("缺类别的重查", TextMessage(source="critic", content="需重查：春熙路 人民币价位区间")),
+            ("否定式重查", TextMessage(source="critic", content="不需要重查：住宿的素材是可信的")),
+            ("非critic重查", TextMessage(source="planner", content="需重查：住宿 换一家")),
         ]
         for label, msg in cases:
             await term.reset()
@@ -700,9 +939,10 @@ def selftest() -> int:
 
     try:
         probe = asyncio.run(_probe())
-        for label in ("问题清单", "附和话", "推理泄露", "否定句", "非critic"):
+        for label in ("问题清单", "附和话", "推理泄露", "否定句", "非critic",
+                      "缺类别的重查", "否定式重查", "非critic重查"):
             check(f"{label} 不触发终止", probe[label] is None, f"实际：{probe[label]}")
-        for label in ("裸APPROVED", "带空白"):
+        for label in ("裸APPROVED", "带空白", "重查标记"):
             check(f"{label} 触发终止", probe[label] is not None, f"实际：{probe[label]}")
         check("handoff 到 user 触发终止", probe["handoff"] is not None, f"实际：{probe['handoff']}")
     except Exception as exc:                       # noqa: BLE001
@@ -898,6 +1138,74 @@ def selftest() -> int:
         team = _FakeTeam([_handoff_batch(f"问题 {i}") for i in range(8)])
         await run_with_handoffs(team, "任务", None, hooks=_quiet(ask=lambda prompt: "继续"))
         out["封顶条数"] = len(team.tasks)
+
+        # ⑥ 自动重查：critic 写「需重查：」，作废该类素材并把声明注入回群聊
+        _material = "【住宿】春熙路一带 经济型/快捷连锁 约300-400/晚（来源：https://b.example）"
+        _marker = "问题 1 条：\n1. 幻觉。住宿行的币种不对，不是可订价。\n需重查：住宿 春熙路 人民币价位区间"
+        asked_auto: list = []
+        board = Board()
+        team = _FakeTeam([[TextMessage(source="researcher", content=_material),
+                           TextMessage(source="critic", content=_marker)],
+                          [TextMessage(source="critic", content="APPROVED")]])
+        await run_with_handoffs(
+            team, "任务", None, board=board,
+            hooks=_quiet(ask=lambda prompt: asked_auto.append(prompt) or "不该被调到"),
+        )
+        out["自动重查 跑了几次"] = len(team.tasks)
+        out["自动重查 没问人"] = not asked_auto
+        out["自动重查 作废了住宿"] = board.items["住宿"] == [] and len(board.stale) == 1
+        third = team.tasks[1] if len(team.tasks) > 1 else None
+        out["自动重查 用 HandoffMessage"] = isinstance(third, HandoffMessage)
+        out["自动重查 target 是 researcher"] = getattr(third, "target", None) == RESEARCHER.name
+        _note = getattr(third, "content", "") or ""
+        out["自动重查 声明含被作废的原文"] = "汉庭" in _note or "春熙路一带" in _note
+        out["自动重查 声明含重查要求"] = "重查要求" in _note and "人民币价位区间" in _note
+
+        # ⑦ 手动重查：用户拍板时写同样的话，走同一套「作废 → 重渲染 → 注入」
+        board = Board()
+        team = _FakeTeam([[TextMessage(source="researcher", content=_material),
+                           TextMessage(source="critic", content="问题 1 条：\n1. 幻觉。"),
+                           HandoffMessage(source="critic", target="user", content="需要拍板")],
+                          [TextMessage(source="critic", content="APPROVED")]])
+        await run_with_handoffs(
+            team, "任务", None, board=board,
+            hooks=_quiet(ask=lambda prompt: "重查：住宿 春熙路人民币价位"),
+        )
+        second = team.tasks[1] if len(team.tasks) > 1 else None
+        out["手动重查 作废了住宿"] = board.items["住宿"] == []
+        out["手动重查 声明进了续跑消息"] = "重查要求" in (getattr(second, "content", "") or "")
+        out["手动重查 仍交回 critic"] = getattr(second, "target", None) == "critic"
+
+        # ⑧ 无进展：critic 连续两轮报同一批问题，第二轮的「问题」位换成证据
+        questions: list = []
+        _same = "问题 1 条：\n1. 幻觉。住宿行的币种不对，应换人民币来源。"
+        team = _FakeTeam([_handoff_batch(_same), _handoff_batch(_same)])
+        await run_with_handoffs(
+            team, "任务", None,
+            hooks=_quiet(ask=lambda prompt: "重查：住宿 换人民币来源",
+                         on_notice=lambda text, kind: questions.append((text, kind)))
+        )
+        out["无进展提示"] = [t for t, k in questions if k == "question"]
+
+        # ⑨ 同一类素材第二次被要求重查 → 升级给人，不再自动重查。
+        # 不设这一条时，critic 反复指名同一类会一路自动重查到撞 MAX_HANDOFFS。
+        esc_notices: list = []
+        esc_asked: list = []
+        board = Board()
+        team = _FakeTeam([[TextMessage(source="researcher", content=_material),
+                           TextMessage(source="critic", content=_marker)],
+                          [TextMessage(source="researcher", content=_material),
+                           TextMessage(source="critic", content=_marker)],
+                          [TextMessage(source="critic", content="APPROVED")]])
+        await run_with_handoffs(
+            team, "任务", None, board=board,
+            hooks=_quiet(ask=lambda prompt: esc_asked.append(prompt) or "住宿按 250/晚",
+                         on_notice=lambda text, kind: esc_notices.append((text, kind))),
+        )
+        out["同类再重查 自动作废次数"] = sum(1 for _, k in esc_notices if k == "warning")
+        out["同类再重查 问了人"] = len(esc_asked) == 1
+        out["同类再重查 提示"] = [t for t, k in esc_notices if k == "question"]
+        out["同类再重查 段数"] = len(team.tasks)
         return out
 
     try:
@@ -929,6 +1237,35 @@ def selftest() -> int:
         check(f"最多问 {MAX_HANDOFFS} 次就收手（1 首次 + {MAX_HANDOFFS} 续跑）",
               hooks_probe["封顶条数"] == MAX_HANDOFFS + 1,
               f"实际：{hooks_probe['封顶条数']}")
+        check("自动重查：作废后自动续跑一次", hooks_probe["自动重查 跑了几次"] == 2,
+              f"实际：{hooks_probe['自动重查 跑了几次']}")
+        check("自动重查不占用人的注意力", hooks_probe["自动重查 没问人"])
+        check("自动重查作废了该类素材", hooks_probe["自动重查 作废了住宿"])
+        check("自动重查用 HandoffMessage 续跑", hooks_probe["自动重查 用 HandoffMessage"])
+        check("自动重查指名 researcher",
+              hooks_probe["自动重查 target 是 researcher"],
+              f"实际：{hooks_probe['自动重查 target 是 researcher']}")
+        check("自动重查的声明含被作废的原文", hooks_probe["自动重查 声明含被作废的原文"])
+        check("自动重查的声明含重查要求", hooks_probe["自动重查 声明含重查要求"])
+        check("手动重查作废了该类素材", hooks_probe["手动重查 作废了住宿"])
+        check("手动重查的声明进了续跑消息", hooks_probe["手动重查 声明进了续跑消息"])
+        check("手动重查仍交回 critic（不动 [9] 的 target 契约）",
+              hooks_probe["手动重查 仍交回 critic"])
+        # 证据是**加在**问题清单前面，不是替掉它——判据可能误判（researcher 重发整份
+        # 清单就会撞上「重复搜索」），替掉的话用户就看不到要回答的那个问题了。
+        _stalled = [t for t in hooks_probe["无进展提示"] if "无进展" in t]
+        check("撞上绕圈时把证据摆给用户", bool(_stalled),
+              f"实际：{hooks_probe['无进展提示']}")
+        check("证据不替掉问题清单本身",
+              bool(_stalled) and all("幻觉" in t for t in _stalled),
+              f"实际：{_stalled}")
+        check("同一类第二次要求重查只自动作废一次",
+              hooks_probe["同类再重查 自动作废次数"] == 1,
+              f"实际：{hooks_probe['同类再重查 自动作废次数']}")
+        check("同一类第二次要求重查时升级给人",
+              hooks_probe["同类再重查 问了人"]
+              and any("自动重查过一次" in t for t in hooks_probe["同类再重查 提示"]),
+              f"实际：{hooks_probe['同类再重查 提示']}")
     except Exception as exc:                       # noqa: BLE001
         check("人机回路探测", False, f"{type(exc).__name__}: {exc}")
 
@@ -1002,6 +1339,92 @@ def selftest() -> int:
     # 针要拼出来：直接写整串的话，这一行自己就会命中（第一次跑就踩了这个自摆乌龙）。
     _needle = "import " + "launcher"
     check("main.py 不反向依赖启动器", _needle not in _Path(__file__).read_text(encoding="utf-8"))
+
+    print("\n[11] 素材台账：解析、作废、幂等")
+    from ledger import CATEGORIES as _CATEGORIES
+    from ledger import Board as _Board
+    from ledger import parse_materials as _parse_materials
+
+    # 逐字取自 researcher 契约（§8.2）里的示例——契约能解析是最低要求，
+    # 真输出能不能解析得靠 `--stage 2` 目视，自测守不了那个。
+    _contract_lines = [
+        "【交通】北京⇄成都 高铁二等座 约750/人 单程（来源：https://a.example）",
+        "【住宿】春熙路一带 经济型/快捷连锁 约300-400/晚（来源：https://b.example）",
+        "【住宿】春熙路 汉庭IFS国金中心店 经济型 4.7分（来源：hotel_options）",
+        "【景点】大熊猫繁育研究基地 成人票55（来源：https://c.example）",
+        "【景点】大熊猫繁育研究基地 6岁以下免票（来源：https://d.example）",
+        "【市内】巡游出租车 起步价10元/3公里，续程2.4元/公里（来源：https://e.example）",
+        "【市内】诸暨站→五泄风景区 27.1公里 打车约71元（来源：taxi_fare 估算）",
+    ]
+    _parsed, _leftover = _parse_materials("\n".join(_contract_lines))
+    check("契约里的 7 行示例全部解析得出", len(_parsed) == 7, f"实际：{len(_parsed)}")
+    check("契约行没有落进未解析桶", not _leftover, f"实际：{_leftover}")
+    check("类别都在四类里", all(m.category in _CATEGORIES for m in _parsed))
+    check("来源含工具名的行也解析得出",
+          any(m.source == "hotel_options" for m in _parsed))
+
+    _board = _Board()
+    _feed = "\n".join(_contract_lines) + "\n这是跑题的一句。"
+    check("首次吸收算作有变化", _board.absorb(_feed) is True)
+    _snapshot = {c: len(v) for c, v in _board.items.items()}
+    check("同一段再喂一次是幂等的", _board.absorb(_feed) is False)
+    check("幂等后条目数不变",
+          {c: len(v) for c, v in _board.items.items()} == _snapshot)
+    # 未解析的行必须留住——丢一行素材，critic 的幻觉比对就少一条依据。
+    check("解析不了的行进了 unparsed", _board.unparsed == ["这是跑题的一句。"],
+          f"实际：{_board.unparsed}")
+    check("未解析的行照样出现在 render 里", "这是跑题的一句。" in _board.render())
+
+    _removed = _board.supersede("住宿")
+    check("作废返回被作废的条目", len(_removed) == 2, f"实际：{len(_removed)}")
+    check("作废后该类清空", _board.items["住宿"] == [])
+    check("作废后 render 不再列出旧条目",
+          "汉庭IFS国金中心店" not in _board.render())
+    _note = _board.corrective_note("住宿", "春熙路 人民币价位区间")
+    check("作废声明逐条列出被作废的素材", "汉庭IFS国金中心店" in _note)
+    check("作废声明带上重查关键词", "春熙路 人民币价位区间" in _note)
+    check("作废其余类别不受影响", len(_board.items["交通"]) == 1)
+    check("非法类别不抛异常、也不作废", _board.supersede("餐饮") == [])
+
+    print("\n[12] 无进展判据：命中真信号，且不误伤假数据")
+    from ledger import detect_stall as _detect
+
+    def _msg(source: str, text: str):
+        return TextMessage(source=source, content=text)
+
+    def _stall_of(messages):
+        return _detect(messages, researcher=RESEARCHER.name,
+                       planner=PLANNER.name, critic=CRITIC.name)
+
+    _urls = "查到 https://x.example/a https://x.example/b https://x.example/c"
+    _hit = _stall_of([_msg("researcher", _urls), _msg("researcher", _urls)])
+    check("连续两轮同一批网址 → 重复搜索",
+          _hit is not None and _hit.kind == "重复搜索", f"实际：{_hit}")
+    check("网址只重合一半 → 不算无进展",
+          _stall_of([_msg("researcher", "https://x.example/a https://x.example/b"),
+                     _msg("researcher", "https://y.example/c https://y.example/d")]) is None)
+    _table = "| Day | 时段 | 项目 | 花费 | 备注 |\n|---|---|---|---|---|\n| 1 | 上午 | 熊猫基地 | 110 | 2人 |"
+    _hit = _stall_of([_msg("planner", _table), _msg("planner", _table)])
+    check("连续两轮逐字相同的表 → 空转表格",
+          _hit is not None and _hit.kind == "空转表格", f"实际：{_hit}")
+    _problems = "问题 1 条：\n1. 幻觉。住宿行的币种不对，应换人民币来源。"
+    _hit = _stall_of([_msg("critic", _problems), _msg("critic", _problems)])
+    check("连续两轮同一批问题 → 重复问题", _hit is not None and _hit.kind == "重复问题")
+
+    # **这条是 [9] 不被误伤的回归保证。** [9] 的假 critic 正文是 "问题 1"…"问题 8"，
+    # 跟真问题清单长得像但不是清单；判据一松，[9] 的段数断言立刻崩。
+    check("「问题 N」这种假正文不误判成问题清单",
+          _stall_of([_msg("critic", "问题 1"), _msg("critic", "问题 2")]) is None)
+    check("只有一条消息时谈不上「连续两轮」", _stall_of([_msg("critic", _problems)]) is None)
+    check("空历史不报无进展", _stall_of([]) is None)
+    # 排序：三条同时命中时，报可信度最高的那条。「researcher 重发整份清单」是会误判的
+    # 最弱信号，不该盖住「critic 在复读」这条实锤。
+    _both = _stall_of([
+        _msg("researcher", _urls), _msg("critic", _problems),
+        _msg("researcher", _urls), _msg("critic", _problems),
+    ])
+    check("三条同时命中时优先报「重复问题」",
+          _both is not None and _both.kind == "重复问题", f"实际：{_both}")
 
     print("\n" + _SEP)
     if failures:

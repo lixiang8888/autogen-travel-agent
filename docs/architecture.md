@@ -36,13 +36,18 @@
 
 ## 3. 什么时候停下来
 
-三条终止条件取**或**（是 `|` 不是 `&`——`&` 要两个同时满足，会一直跑到上限）：
+四条终止条件取**或**（是 `|` 不是 `&`——`&` 要两个同时满足，会一直跑到上限）：
 
 | 条件 | 含义 |
 | --- | --- |
 | `ExactTextTermination("APPROVED", "critic")` | critic 认可，且**整条消息恰好是** `APPROVED` |
+| `MarkedLineTermination("需重查：", "critic")` | critic 指名某类素材不可信，**某一行**匹配重查格式 |
 | `HandoffTermination(target="user")` | 需要你拍板，控制权交回 |
 | `MaxMessageTermination(15)` | 兜底保险丝 |
+
+第二条是 [§11 素材台账](#11-素材台账为什么重查不等于回退) 的入口。它跟第一条是同一个
+教训的产物：都**不能**用子串匹配（理由见下），只是一个要求整条消息相等、一个只要求
+某一行相等。
 
 第一条为什么不用 `TextMentionTermination`：那个按**子串**匹配任意消息，而 critic 会把
 思考写进消息正文，只要那段思考里出现 `APPROVED`（**哪怕是否定句**「我还不能输出
@@ -61,6 +66,7 @@ docs/agents/         四个 agent 的说明书：角色、边界、产出契约
 llm.py               DeepSeek 客户端（AutoGen 的 OpenAIChatCompletionClient）
 tools.py             search + fetch_page(Tavily) + taxi_fare / hotel_options(高德) + calculator
 persona.py           三个 LLM agent 的人格（角色 prompt + 格式契约）
+ledger.py            群聊之外的状态：素材台账 + 无进展判据（不认识 AutoGen）
 main.py              组队、终止条件、入口、离线自测
 launcher.py          网页启动器（可选：删掉它 --selftest 照样绿）
 make_shortcut.py     在 Windows 桌面建「点击就启动」的快捷方式（只在 WSL 上有意义）
@@ -94,8 +100,10 @@ system_message = 角色 prompt + "\n\n" + 格式契约
 | [3] | 工具挂载关系，以及各工具的入参守卫（坏 JSON / 缺参数）在联网前返回 |
 | [6] | 终止条件各条分支——尤其「推理里出现 APPROVED 不能提前终止」 |
 | [8] | `docs/agents/*.md` §8.1/§8.2 与 `persona.py` 逐字一致 |
-| [9] | 人机回路：回调接缝与 `--reply` 队列（这段曾零覆盖，是补的历史欠账） |
+| [9] | 人机回路：回调接缝、`--reply` 队列（这段曾零覆盖，是补的历史欠账），以及重查/无进展两个新分支 |
 | [10] | `launcher.py` 语法 + 分层红线（`main.py` 不反向依赖启动器） |
+| [11] | 台账：解析、幂等、作废、未解析行不丢 |
+| [12] | 无进展判据：三条信号各自命中，**且 假数据 `"问题 N"` 不误判**（这条同时守着 [9]） |
 
 ## 6. 调试：逐阶段跑
 
@@ -225,5 +233,84 @@ system_message = 角色 prompt + "\n\n" + 格式契约
 | 换搜索后端 | `tools.py` 里的 `search()` |
 | 调轮数上限 / 最多问几次 | `main.py` 的 `MaxMessageTermination` / `MAX_HANDOFFS` |
 | 换 AI 的说话顺序 | `main.py` 的 `GROUP_MEMBERS` |
+| 改重查标记的格式 | `main.py` 的 `_RESEARCH_RE` + `persona.py` 的 critic 契约 + `critic.md` §8.2（**三处**） |
+| 改台账的四类怎么分 | `ledger.py` 的 `CATEGORIES` + researcher 契约里的类别说明 |
+| 调无进展的敏感度 | `ledger.py` 的 `SEARCH_OVERLAP_THRESHOLD` 与三条 `_*_stall` 判据 |
+| 换台账的填充来源 | `ledger.py` 的 `parse_materials()`（目前解析 researcher 的 Markdown） |
 
 最后几行是**连体改动**，改一处忘一处会静默退化成「跑到上限才停」。
+
+---
+
+## 11. 素材台账：为什么「重查」不等于「回退」
+
+**先说一个反直觉的实测结论：重查的路由一直是通的，卡住的是作废。**
+
+`RoundRobinGroupChat` 的 `select_speaker` **纯按索引轮转，完全忽略 `HandoffMessage`
+的 `target`**（源码 `_round_robin_group_chat.py:72-83`）。顺序是 researcher → planner
+→ critic，critic 说完，索引归 0——所以**每一次 handoff 续跑后，下一个发言的本来就是
+researcher**。`main.py` 里那个 `target="critic"` 只是消息上的一个标签，不影响谁说话。
+
+那问题在哪？**在旧素材不作废。** 群聊上下文是只追加的消息序列，没有撤销。实测里
+researcher 把 `hk.trip.com` 的 `HK$493` 商圈均价当房价采信（第 7 节第 13 条），
+critic 报错、researcher 重查——**新旧两版都留在 thread 里**，planner 照抄的是哪一版
+全凭运气，critic 做幻觉比对时两版都算「素材」。
+
+### 台账怎么做
+
+`ledger.py` 是一个**群聊之外的状态对象**，把素材从消息流里捞出来：
+
+```
+researcher 的 Markdown ──parse_materials()──▶ Board{四类条目, 未解析行, 已作废}
+                                                    │
+                        critic 写「需重查：住宿 …」 ──▶ supersede(住宿)
+                                                    │
+                                          corrective_note() ──注入回群聊──▶ researcher
+```
+
+两条硬约束，都有具体理由：
+
+- **靠解析填充，不加新工具。** `tools.py` 的工具全是无状态纯函数（「每次返回同一批
+  函数对象——它们是纯函数，无状态」），加一个有状态工具会破坏那个设计。而
+  researcher 的 `format_contract` 本来就强制了刚性行格式 `【类别】内容 价格（来源：URL）`，
+  文档明写这是「给下游 agent 读的接口」——它本来就是为被解析而设计的。
+- **解析不出来的行走 `unparsed`，不许静默丢弃**，并且照样出现在 `render()` 里。
+  丢一行素材，critic 的幻觉比对就少一条依据，而且没人会发现。这条对齐 researcher.md
+  里「把『缺』从一个被掩盖的状态，变成一个被暴露的状态」。
+
+### 两个入口，一条路径
+
+| 入口 | 谁触发 | 判据 |
+| --- | --- | --- |
+| 自动 | critic 写 `需重查：<类别> <关键词>` | 严格：整行匹配，且类别必须是四类之一 |
+| 手动 | 你在拍板框里回 `重查：<类别> …` | 宽松：`重` 前的「需」可省 |
+
+两条入口解析完之后的「作废 → 重渲染 → 注入」是同一段代码。判据宽严不同是**有意的**：
+严格那条是专门用来防 critic 的推理泄露的（它会把思考写进正文，见第 7 节第 3 条），
+而真人不在这个威胁模型里——要求人一字不差地打「需重查：」只会让这个入口没人用。
+
+**同一类素材只自动重查一次。** 第二次被要求重查时不再自动跑，改为升级给人。理由是
+第一次重查没解决问题，再执行一遍同样的动作不太可能有用——压力测试里不设这一条时，
+critic 反复指名同一类会一路自动重查到撞 `MAX_HANDOFFS`，六轮全白烧。这跟无进展判据
+是同一条原则：**分不清「在收敛」和「在原地绕圈」时，交给人。**
+
+### 无进展判据
+
+三条文末没有的确定性信号（不调 LLM）：researcher 连续两轮 URL 集合重合 ≥ 80%、
+critic 连续两轮报同一批问题、planner 连续两轮输出逐字相同的表。命中就**把证据摆在
+问题清单前面交给你拍板**，而不是把同一个问题第三次端上来。
+
+判据**必须只认符合契约形态的消息**。自测 [9] 的假 critic 正文是 `"问题 1"`…`"问题 8"`，
+跟真问题清单长得像但不是清单——判据一松，[9] 那几条锁着「`--reply` 用完绝不回退到
+`ask`」的断言立刻崩。[12] 专门守着这一点。
+
+### 做不到什么（记录在案，别误以为有）
+
+- **不是事务回滚。** 作废只影响台账这个对象，**旧消息仍然留在群聊上下文里**。
+  起作用的是「作废声明本身也是一条消息」——planner 和 critic 的契约里各加了一条
+  「被作废的条目不再算素材」，靠契约而不是靠删消息。
+- **没有快照回退。** `RoundRobinGroupChat` 有 `save_state()` / `load_state()`，能真把
+  状态退到某个检查点，但那要重跑整段 LLM 调用、并且会丢掉你已经拍板的话。**本次
+  没做**，留作后续选项。
+- **台账只认四类。** critic 若写「需重查：餐饮 …」，`_RESEARCH_RE` 不匹配，这一轮
+  不会终止、也不会作废任何东西——它会退化成一条普通问题。
