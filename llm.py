@@ -22,6 +22,7 @@ llm.py —— 模型客户端：DeepSeek 走 OpenAI 兼容协议
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from pathlib import Path
 
 from autogen_ext.models.openai import OpenAIChatCompletionClient
@@ -32,7 +33,6 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 #: 认的是 `deepseek-flash` 和 `deepseek-v4-pro`（后者是推理模型，慢且贵）。
 #: 要换模型就设环境变量 / keys.py / .env 里的 DEEPSEEK_MODEL，不用动代码。
 DEFAULT_MODEL = "deepseek-flash"
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "").strip() or DEFAULT_MODEL
 
 ENV_DEEPSEEK = "DEEPSEEK_API_KEY"
 ENV_TAVILY = "TAVILY_API_KEY"
@@ -43,7 +43,7 @@ ENV_AMAP = "AMAP_API_KEY"
 # 1. 取 key：环境变量 > keys.py > .env
 # ---------------------------------------------------------------------------
 
-def load_key(env_name: str, key_module_attr: str | None = None) -> str:
+def load_key(env_name: str) -> str:
     """按 环境变量 > keys.py > .env 的顺序取一个 key。
 
     环境变量排第一是有意的——它不进版本库，不会随文件被误提交。
@@ -52,7 +52,7 @@ def load_key(env_name: str, key_module_attr: str | None = None) -> str:
     if value:
         return value
 
-    value = _from_keys_module(key_module_attr or env_name)
+    value = _from_keys_module(env_name)
     if value:
         return value
 
@@ -68,10 +68,12 @@ def _from_keys_module(attr: str) -> str:
     return str(getattr(keys_module, attr, "") or "").strip()
 
 
+@lru_cache(maxsize=None)
 def _from_dotenv(env_name: str) -> str:
     """从项目根目录的 .env 里读一行 KEY=VALUE。
 
     手写十行，不引 python-dotenv——这个项目不值得多一个依赖。
+    进程内只读一次：工具一跑就是十几次调用，没必要每次都开文件。
     """
     env_file = Path(__file__).resolve().parent / ".env"
     if not env_file.is_file():
@@ -107,9 +109,9 @@ def build_model(api_key: str | None = None) -> OpenAIChatCompletionClient:
             "  2. export DEEPSEEK_API_KEY=sk-...\n"
             "  3. 在项目根目录建 .env，写一行 DEEPSEEK_API_KEY=sk-..."
         )
-    # 模型名优先从配置里取，取不到才用模块级默认值
+    # 模型名优先从配置里取，取不到才用默认值
     # ——这样改模型不用动代码，也方便在阶段 1 快速试哪个名字能通。
-    model_name = load_key("DEEPSEEK_MODEL") or DEEPSEEK_MODEL
+    model_name = load_key("DEEPSEEK_MODEL") or DEFAULT_MODEL
     return OpenAIChatCompletionClient(
         model=model_name,
         base_url=DEEPSEEK_BASE_URL,

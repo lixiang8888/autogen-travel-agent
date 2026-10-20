@@ -32,7 +32,7 @@ build_system_prompt 体例。现在不抽，是因为第一次学群聊编排，
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +47,7 @@ class AgentSpec:
     role_prompt: str                              # docs/agents/<name>.md §8.1
     format_contract: str                          # docs/agents/<name>.md §8.2
     tool_names: tuple[str, ...] = ()              # 名字要能在 tools.ALL_TOOLS 里找到
-    handoffs: tuple[str, ...] = field(default=()) # 声明能把手交给谁，只有 critic 有
+    handoffs: tuple[str, ...] = ()                # 声明能把手交给谁，只有 critic 有
 
 
 def build_system_message(spec: AgentSpec) -> str:
@@ -211,5 +211,3 @@ APPROVED
 #: 进群聊的三个 LLM agent，顺序就是 RoundRobin 的说话顺序。
 #: user 不在里面——它不是 LLM agent，靠 HandoffMessage 接话（见 main.py）。
 GROUP_MEMBERS: tuple[AgentSpec, ...] = (RESEARCHER, PLANNER, CRITIC)
-
-ALL_SPECS: dict[str, AgentSpec] = {s.name: s for s in GROUP_MEMBERS}

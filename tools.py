@@ -57,6 +57,20 @@ TAVILY_SEARCH_DEPTH = "advanced"
 FETCH_MAX_CHARS = 4000
 
 
+def _tavily(path: str, api_key: str, payload: dict, timeout: int,
+            failure: str, hint: str) -> tuple[dict, str]:
+    """POST 一次 Tavily。返回 (数据, 错误信息)，错误信息为空串表示成功。"""
+    import requests   # 延迟导入：只用 calculator 的场合不必装 requests
+
+    try:
+        resp = requests.post(f"{TAVILY_BASE}{path}",
+                             json={"api_key": api_key, **payload}, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json(), ""
+    except Exception as exc:                       # noqa: BLE001 —— 工具层不抛异常
+        return {}, f"{failure}：{type(exc).__name__}: {exc}。{hint}"
+
+
 # ---------------------------------------------------------------------------
 # 1. search —— 只挂给 researcher
 # ---------------------------------------------------------------------------
@@ -76,23 +90,14 @@ def search(query: str) -> str:
     if not api_key:
         return "错误：未配置 Tavily API key（环境变量 TAVILY_API_KEY 或 keys.py）"
 
-    import requests   # 延迟导入：只用 calculator 的场合不必装 requests
-
-    try:
-        resp = requests.post(
-            f"{TAVILY_BASE}/search",
-            json={
-                "api_key": api_key,
-                "query": query,
-                "search_depth": TAVILY_SEARCH_DEPTH,
-                "max_results": TAVILY_MAX_RESULTS,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:                       # noqa: BLE001 —— 工具层不抛异常
-        return f"搜索失败：{type(exc).__name__}: {exc}。可以换个关键词重试。"
+    data, err = _tavily(
+        "/search", api_key,
+        {"query": query, "search_depth": TAVILY_SEARCH_DEPTH,
+         "max_results": TAVILY_MAX_RESULTS},
+        60, "搜索失败", "可以换个关键词重试。",
+    )
+    if err:
+        return err
 
     results = data.get("results") or []
     if not results:
@@ -129,18 +134,12 @@ def fetch_page(url: str) -> str:
     if not url.startswith(("http://", "https://")):
         return f"错误：{url!r} 不是完整网址。请从 search 结果的「来源：」处整条复制。"
 
-    import requests
-
-    try:
-        resp = requests.post(
-            f"{TAVILY_BASE}/extract",
-            json={"api_key": api_key, "urls": [url], "extract_depth": "advanced"},
-            timeout=90,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:                       # noqa: BLE001 —— 工具层不抛异常
-        return f"打开网页失败：{type(exc).__name__}: {exc}。可以换一个来源再试。"
+    data, err = _tavily(
+        "/extract", api_key, {"urls": [url], "extract_depth": "advanced"},
+        90, "打开网页失败", "可以换一个来源再试。",
+    )
+    if err:
+        return err
 
     results = data.get("results") or []
     if not results:
@@ -250,6 +249,25 @@ def _amap_location(place: str, city: str, api_key: str) -> tuple[str, str]:
     return geocodes[0].get("location", ""), ""
 
 
+def _json_args(arguments: str, example: str, *required: str) -> tuple[dict, str]:
+    """解析并校验工具入参。返回 (对象, 错误信息)，错误信息为空串表示成功。
+
+    先校参数、后查 key：参数写错是模型自己能改的错，应该优先报出来；顺带让自测
+    能在没有 key 的机器上离线测这些守卫（见 main.py 第 [3] 节）。
+    """
+    import json
+
+    try:
+        args = json.loads(arguments)
+    except json.JSONDecodeError as exc:
+        return {}, f"参数不是合法 JSON：{exc}。应形如 {example}"
+    if not isinstance(args, dict):
+        return {}, f"参数应是一个 JSON 对象，形如 {example}"
+    if any(not str(args.get(field, "")).strip() for field in required):
+        return {}, f"缺少 {' 或 '.join(required)}。应形如 {example}"
+    return args, ""
+
+
 def taxi_fare(arguments: str) -> str:
     """算两地之间开车要多久、多远，以及打车大概多少钱。
 
@@ -264,22 +282,15 @@ def taxi_fare(arguments: str) -> str:
                    可选 city 用于消歧。例如
                    {"from": "诸暨站", "to": "五泄风景区", "city": "诸暨"}
     """
-    import json
-
-    # 先校参数、后查 key：参数写错是模型自己能改的错，应该优先报出来；
-    # 顺带让自测能在没有高德 key 的机器上离线测这两条守卫（见 main.py 第 [3] 节）。
-    try:
-        args = json.loads(arguments)
-    except json.JSONDecodeError as exc:
-        return f'参数不是合法 JSON：{exc}。应形如 {{"from":"诸暨站","to":"五泄风景区","city":"诸暨"}}'
-    if not isinstance(args, dict):
-        return '参数应是一个 JSON 对象，形如 {"from":"诸暨站","to":"五泄风景区","city":"诸暨"}'
+    args, err = _json_args(
+        arguments, '{"from":"诸暨站","to":"五泄风景区","city":"诸暨"}', "from", "to"
+    )
+    if err:
+        return err
 
     origin_name = str(args.get("from", "")).strip()
     dest_name = str(args.get("to", "")).strip()
     city = str(args.get("city", "")).strip()
-    if not origin_name or not dest_name:
-        return '缺少 from 或 to。应形如 {"from":"诸暨站","to":"五泄风景区","city":"诸暨"}'
 
     api_key = load_key(ENV_AMAP)
     if not api_key:
@@ -345,20 +356,14 @@ def hotel_options(arguments: str) -> str:
                    例如 {"city": "成都", "keywords": "春熙路 快捷酒店"}
                    档位词可用：快捷酒店 / 经济型 / 商务酒店 / 舒适型 / 高档型 / 民宿
     """
-    import json
-
-    # 先校参数、后查 key，理由同 taxi_fare（自测要能在没有 key 的机器上离线测守卫）
-    try:
-        args = json.loads(arguments)
-    except json.JSONDecodeError as exc:
-        return f'参数不是合法 JSON：{exc}。应形如 {{"city":"成都","keywords":"春熙路 快捷酒店"}}'
-    if not isinstance(args, dict):
-        return '参数应是一个 JSON 对象，形如 {"city":"成都","keywords":"春熙路 快捷酒店"}'
+    args, err = _json_args(
+        arguments, '{"city":"成都","keywords":"春熙路 快捷酒店"}', "city", "keywords"
+    )
+    if err:
+        return err
 
     city = str(args.get("city", "")).strip()
     keywords = str(args.get("keywords", "")).strip()
-    if not city or not keywords:
-        return '缺少 city 或 keywords。应形如 {"city":"成都","keywords":"春熙路 快捷酒店"}'
 
     api_key = load_key(ENV_AMAP)
     if not api_key:

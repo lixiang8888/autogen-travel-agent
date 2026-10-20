@@ -277,8 +277,8 @@ def _problem_stall(texts: list[str]) -> Stall | None:
     prev, curr = lists[-2], lists[-1]
     if not prev or not curr:
         return None
-    kept = [item for item in curr if item in set(prev)]
-    if len(kept) != len(curr):
+    prev_set = set(prev)
+    if any(item not in prev_set for item in curr):
         return None
     return Stall(
         kind="重复问题",

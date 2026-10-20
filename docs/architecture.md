@@ -232,7 +232,7 @@ system_message = 角色 prompt + "\n\n" + 格式契约
 | 加一个新工具 | `tools.py` + `persona.py` |
 | 换搜索后端 | `tools.py` 里的 `search()` |
 | 调轮数上限 / 最多问几次 | `main.py` 的 `MaxMessageTermination` / `MAX_HANDOFFS` |
-| 换 AI 的说话顺序 | `main.py` 的 `GROUP_MEMBERS` |
+| 换 AI 的说话顺序 | `persona.py` 的 `GROUP_MEMBERS`（阶段 5 直接用它组队） |
 | 改重查标记的格式 | `main.py` 的 `_RESEARCH_RE` + `persona.py` 的 critic 契约 + `critic.md` §8.2（**三处**） |
 | 改台账的四类怎么分 | `ledger.py` 的 `CATEGORIES` + researcher 契约里的类别说明 |
 | 调无进展的敏感度 | `ledger.py` 的 `SEARCH_OVERLAP_THRESHOLD` 与三条 `_*_stall` 判据 |

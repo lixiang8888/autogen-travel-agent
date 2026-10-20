@@ -57,7 +57,7 @@ from autogen_agentchat.teams import RoundRobinGroupChat
 
 from ledger import Board, detect_stall
 from llm import build_model
-from persona import CRITIC, PLANNER, RESEARCHER, AgentSpec, build_system_message
+from persona import CRITIC, GROUP_MEMBERS, PLANNER, RESEARCHER, AgentSpec, build_system_message
 from tools import build_tools
 
 DEFAULT_TASK = "帮我规划国庆去成都玩三天，两个人，预算 4000，北京出发。"
@@ -103,7 +103,35 @@ _ASK_PROMPT = f"\n{ASK_HINT}> "
 # 1. 造 agent 和 team
 # ---------------------------------------------------------------------------
 
-class ExactTextTermination(TerminationCondition):
+class _SourceTermination(TerminationCondition):
+    """按「指定 agent 的消息内容」终止。matcher 决定什么算命中。"""
+
+    def __init__(self, source: str, matcher: Callable[[str], bool], stop_text: str) -> None:
+        self._source = source
+        self._matcher = matcher
+        self._stop_text = stop_text
+        self._terminated = False
+
+    @property
+    def terminated(self) -> bool:
+        return self._terminated
+
+    async def __call__(self, messages) -> StopMessage | None:
+        if self._terminated:
+            raise TerminatedException("Termination condition has already been reached")
+        for message in messages:
+            content = getattr(message, "content", "")
+            if (getattr(message, "source", None) == self._source
+                    and isinstance(content, str) and self._matcher(content)):
+                self._terminated = True
+                return StopMessage(content=self._stop_text, source=type(self).__name__)
+        return None
+
+    async def reset(self) -> None:
+        self._terminated = False
+
+
+class ExactTextTermination(_SourceTermination):
     """只在「某个 agent 发出的**一条消息恰好等于**该文本」时终止。
 
     为什么不用 `TextMentionTermination("APPROVED")`：那个按**子串**匹配任意消息，
@@ -123,31 +151,11 @@ class ExactTextTermination(TerminationCondition):
     """
 
     def __init__(self, text: str, source: str) -> None:
-        self._text = text
-        self._source = source
-        self._terminated = False
-
-    @property
-    def terminated(self) -> bool:
-        return self._terminated
-
-    async def __call__(self, messages) -> StopMessage | None:
-        if self._terminated:
-            raise TerminatedException("Termination condition has already been reached")
-        for message in messages:
-            if getattr(message, "source", None) != self._source:
-                continue
-            content = getattr(message, "content", "")
-            if isinstance(content, str) and content.strip() == self._text:
-                self._terminated = True
-                return StopMessage(
-                    content=f"'{self._text}' from {self._source} (exact match)",
-                    source="ExactTextTermination",
-                )
-        return None
-
-    async def reset(self) -> None:
-        self._terminated = False
+        super().__init__(
+            source,
+            lambda content: content.strip() == text,
+            f"'{text}' from {source} (exact match)",
+        )
 
 
 #: critic 用来要求重查素材的标记。台账机制的另一半在 ledger.py。
@@ -170,7 +178,7 @@ _RESEARCH_RE = re.compile(r"^需重查：\s*(交通|住宿|景点|市内)\s*(\S.
 _USER_RESEARCH_RE = re.compile(r"^(?:需)?重查：\s*(交通|住宿|景点|市内)\s*(\S.*)?$")
 
 
-class MarkedLineTermination(TerminationCondition):
+class MarkedLineTermination(_SourceTermination):
     """某个 agent 发出的消息里，有**一行**匹配给定正则时终止。
 
     与 `ExactTextTermination` 的区别：那个要求整条消息恰好等于某文本，这个只要求
@@ -179,34 +187,12 @@ class MarkedLineTermination(TerminationCondition):
     """
 
     def __init__(self, pattern: re.Pattern[str], source: str) -> None:
-        self._pattern = pattern
-        self._source = source
-        self._terminated = False
-
-    @property
-    def terminated(self) -> bool:
-        return self._terminated
-
-    async def __call__(self, messages) -> StopMessage | None:
-        if self._terminated:
-            raise TerminatedException("Termination condition has already been reached")
-        for message in messages:
-            if getattr(message, "source", None) != self._source:
-                continue
-            content = getattr(message, "content", "")
-            if not isinstance(content, str):
-                continue
-            for line in content.splitlines():
-                if self._pattern.match(line.strip()):
-                    self._terminated = True
-                    return StopMessage(
-                        content=f"{RESEARCH_MARKER!r} in a line from {self._source}",
-                        source="MarkedLineTermination",
-                    )
-        return None
-
-    async def reset(self) -> None:
-        self._terminated = False
+        super().__init__(
+            source,
+            lambda content: any(pattern.match(line.strip())
+                                for line in content.splitlines()),
+            f"{RESEARCH_MARKER!r} in a line from {source}",
+        )
 
 
 def build_termination():
@@ -400,13 +386,15 @@ def stopped_for_user(result: TaskResult) -> bool:
     return isinstance(last, HandoffMessage) and getattr(last, "target", "") == "user"
 
 
-def last_content(result: TaskResult) -> str:
-    """取最后一条**文本**消息。跳过 content 是列表的工具调用事件。"""
+def _last_text_message(result: TaskResult):
+    """取最后一条**文本**消息。跳过 HandoffMessage 和 content 是列表的工具事件。"""
     for message in reversed(result.messages):
+        if isinstance(message, HandoffMessage):
+            continue                      # 跳过 handoff 本身，要的是它前面那段
         content = getattr(message, "content", "")
         if isinstance(content, str) and content.strip():
-            return content.strip()
-    return ""
+            return message
+    return None
 
 
 def last_substantive_content(result: TaskResult) -> str:
@@ -424,13 +412,8 @@ def last_substantive_content(result: TaskResult) -> str:
     「需要用户拍板」四个字，完全不知道要决定什么——人机回路等于白设。
     这里往前翻，把那段正文捞出来给用户看。
     """
-    for message in reversed(result.messages):
-        if isinstance(message, HandoffMessage):
-            continue                      # 跳过 handoff 本身，要的是它前面那段
-        content = getattr(message, "content", "")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-    return ""
+    message = _last_text_message(result)
+    return message.content.strip() if message else ""
 
 
 @dataclass(frozen=True)
@@ -464,18 +447,10 @@ def research_request(result: TaskResult) -> ResearchRequest | None:
     **只看最后一条有正文的消息，且必须出自 critic。** 往前翻会把上一轮的旧要求
     重新捞出来，变成一个永不退出的重查循环。
     """
-    if not result.messages:
-        return None
-    for message in reversed(result.messages):
-        if isinstance(message, HandoffMessage):
-            continue
-        content = getattr(message, "content", "")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        if getattr(message, "source", "") != CRITIC.name:
-            return None                   # 最后说话的不是 critic，它的话不作数
-        return parse_research_line(content)
-    return None
+    message = _last_text_message(result)
+    if message is None or getattr(message, "source", "") != CRITIC.name:
+        return None                       # 最后说话的不是 critic，它的话不作数
+    return parse_research_line(message.content)
 
 
 def absorb_into(board: Board | None, messages) -> None:
@@ -496,7 +471,7 @@ def absorb_into(board: Board | None, messages) -> None:
             board.absorb(content)
 
 
-def remember(history: list, messages) -> list:
+def remember(history: list, messages, seen: set[int] | None = None) -> list:
     """把消息按原对象去重后追加进历史，**返回这次真正新加进来的那些**。
 
     两件事共用这一次遍历：
@@ -506,8 +481,10 @@ def remember(history: list, messages) -> list:
     - 但自测的 `_FakeTeam` 给的是累计列表，直接追加会把同一条算两遍，把「自己和
       自己比」误判成重复；台账那边更糟，会把刚作废的条目复活。按对象身份去重同时
       满足这两种形态（history 持有引用，id 不会被回收复用）。
+
+    `seen` 可以跨次传进来，省掉每次重建一遍 id 集合；不传就按 history 现建。
     """
-    seen = {id(m) for m in history}
+    seen = seen if seen is not None else {id(m) for m in history}
     fresh: list = []
     for message in messages or ():
         if id(message) not in seen:
@@ -621,6 +598,16 @@ async def stage2_researcher() -> None:
             print("✗ 输出里没有外部网址——工具可能没调通，回查 tools.py 与 Tavily key。")
 
 
+async def _run_stage(specs) -> None:
+    """阶段 3/4 共用：造队、硬停、收尾。"""
+    model = build_model()
+    try:
+        team = build_team(model, specs, max_turns=STAGE3_MAX_TURNS)
+        await run_and_print(team, DEFAULT_TASK)
+    finally:
+        await model.close()
+
+
 async def stage3_two_agents() -> None:
     """阶段 3 · 两个 agent 进群聊（先不设终止条件，max_turns 硬停）。
 
@@ -628,10 +615,7 @@ async def stage3_two_agents() -> None:
     （具体的酒店区域、具体票价），而不是自己编了一套。
     如果 planner 在编，说明素材没进到它的上下文里。
     """
-    model = build_model()
-    team = build_team(model, (RESEARCHER, PLANNER), max_turns=STAGE3_MAX_TURNS)
-    await run_and_print(team, DEFAULT_TASK)
-    await model.close()
+    await _run_stage((RESEARCHER, PLANNER))
 
 
 async def stage4_with_critic() -> None:
@@ -640,10 +624,7 @@ async def stage4_with_critic() -> None:
     验证点：critic 至少挑出**一个真问题**（时间冲突 / 绕路 / 预算超支 / 幻觉）。
     如果 critic 一直在说「行程很合理」——那是失败，不是成功。
     """
-    model = build_model()
-    team = build_team(model, (RESEARCHER, PLANNER, CRITIC), max_turns=STAGE3_MAX_TURNS)
-    await run_and_print(team, DEFAULT_TASK)
-    await model.close()
+    await _run_stage((RESEARCHER, PLANNER, CRITIC))
 
 
 async def run_with_handoffs(team, task, replies=None, *, hooks=None, board=None) -> TaskResult:
@@ -676,6 +657,7 @@ async def run_with_handoffs(team, task, replies=None, *, hooks=None, board=None)
     #: 跨段累积的消息，只给无进展判据用。`TaskResult.messages` 是每段的增量，
     #: 只看一段凑不齐「连续两条同源消息」。
     history: list = []
+    seen: set[int] = set()
     #: 总预算。三类续跑（拍板 / 无进展 / 自动重查）共用一个上限——自动重查也吃
     #: 这个预算是有意的：没有它，critic 反复要求重查就能拖到 MaxMessageTermination
     #: 才停，而且中途没人看得见。
@@ -687,7 +669,7 @@ async def run_with_handoffs(team, task, replies=None, *, hooks=None, board=None)
     researched: set[str] = set()
 
     while rounds < MAX_HANDOFFS:
-        absorb_into(board, remember(history, result.messages))
+        absorb_into(board, remember(history, result.messages, seen))
 
         request = research_request(result)
         if request is None and not stopped_for_user(result):
@@ -785,7 +767,7 @@ async def stage5_full(task: str, replies: list[str] | None = None, *, hooks=None
             # "External termination requested"），run_and_print 的 assert 不用动，
             # 也不用伪造 TaskResult。粒度是一个 agent 回合。
             termination = termination | hooks.stop
-        team = build_team(model, (RESEARCHER, PLANNER, CRITIC), termination=termination)
+        team = build_team(model, GROUP_MEMBERS, termination=termination)
         await run_with_handoffs(team, task, replies, hooks=hooks, board=board)
     finally:
         # 循环中途抛异常时也要关掉 client（重构前这条路径会漏关）。
@@ -964,12 +946,12 @@ def selftest() -> int:
             _print_message(event)                            # 以前这里 AttributeError
         check("_print_message 能吃列表 content", True)
 
-        class _FakeResult:                                   # last_content 只用 .messages
+        class _FakeResult:                       # 取正文的函数只用 .messages
             messages = [event]
 
         with contextlib.redirect_stdout(io.StringIO()):
-            got = last_content(_FakeResult())
-        check("last_content 会跳过工具事件", got == "", f"实际：{got!r}")
+            got = last_substantive_content(_FakeResult())
+        check("取正文时跳过工具事件", got == "", f"实际：{got!r}")
     except AttributeError as exc:
         check("消息打印处理列表 content", False, f"AttributeError: {exc}")
     except Exception as exc:                                 # noqa: BLE001
@@ -1210,47 +1192,39 @@ def selftest() -> int:
 
     try:
         hooks_probe = asyncio.run(_probe_hooks())
-        check("on_message 收到原始 message 对象", hooks_probe["原始对象"])
-        check("on_message 给了就不再打印到 stdout", hooks_probe["不打印"],
-              f"实际：{hooks_probe['不打印']!r}")
-        check("run_and_print 仍返回 TaskResult", hooks_probe["返回 TaskResult"])
-        check("续跑了一次", hooks_probe["续跑条数"] == 2, f"实际：{hooks_probe['续跑条数']}")
-        check("续跑用的是 HandoffMessage", hooks_probe["续跑是 HandoffMessage"])
-        check("续跑 source 是 user", hooks_probe["续跑 source"] == "user",
-              f"实际：{hooks_probe['续跑 source']}")
-        check("续跑交回给 critic（触发 handoff 的那个）", hooks_probe["续跑 target"] == "critic",
-              f"实际：{hooks_probe['续跑 target']}")
-        check("续跑 content 是人的原话", hooks_probe["续跑 content"] == "住宿砍到 250 一晚",
-              f"实际：{hooks_probe['续跑 content']}")
-        check("--reply 预设用完绝不回退到 ask", hooks_probe["预设用完时 ask 次数"] == 0,
-              f"实际调了 {hooks_probe['预设用完时 ask 次数']} 次")
-        check("--reply 第 3 次不给就停（1 首次 + 2 续跑）", hooks_probe["预设用完跑了几次"] == 3,
-              f"实际：{hooks_probe['预设用完跑了几次']}")
+
+        def chk(label: str, key: str, expected=True) -> None:
+            got = hooks_probe[key]
+            check(label, got == expected, f"实际：{got!r}")
+
+        chk("on_message 收到原始 message 对象", "原始对象")
+        chk("on_message 给了就不再打印到 stdout", "不打印")
+        chk("run_and_print 仍返回 TaskResult", "返回 TaskResult")
+        chk("续跑了一次", "续跑条数", 2)
+        chk("续跑用的是 HandoffMessage", "续跑是 HandoffMessage")
+        chk("续跑 source 是 user", "续跑 source", "user")
+        chk("续跑交回给 critic（触发 handoff 的那个）", "续跑 target", "critic")
+        chk("续跑 content 是人的原话", "续跑 content", "住宿砍到 250 一晚")
+        chk("--reply 预设用完绝不回退到 ask", "预设用完时 ask 次数", 0)
+        chk("--reply 第 3 次不给就停（1 首次 + 2 续跑）", "预设用完跑了几次", 3)
         check("ask 拿不到输入 → 干净停下",
               ("（没有拿到输入，停在当前进度。）", "note") in hooks_probe["没有输入 通知"])
-        check("拿不到输入后不再续跑", hooks_probe["没有输入 条数"] == 1,
-              f"实际：{hooks_probe['没有输入 条数']}")
+        chk("拿不到输入后不再续跑", "没有输入 条数", 1)
         check("ask 返回空串 → 空输入停止",
               ("（空输入，停止。）", "plain") in hooks_probe["空输入 通知"])
-        check("空输入后不再续跑", hooks_probe["空输入 条数"] == 1,
-              f"实际：{hooks_probe['空输入 条数']}")
-        check(f"最多问 {MAX_HANDOFFS} 次就收手（1 首次 + {MAX_HANDOFFS} 续跑）",
-              hooks_probe["封顶条数"] == MAX_HANDOFFS + 1,
-              f"实际：{hooks_probe['封顶条数']}")
-        check("自动重查：作废后自动续跑一次", hooks_probe["自动重查 跑了几次"] == 2,
-              f"实际：{hooks_probe['自动重查 跑了几次']}")
-        check("自动重查不占用人的注意力", hooks_probe["自动重查 没问人"])
-        check("自动重查作废了该类素材", hooks_probe["自动重查 作废了住宿"])
-        check("自动重查用 HandoffMessage 续跑", hooks_probe["自动重查 用 HandoffMessage"])
-        check("自动重查指名 researcher",
-              hooks_probe["自动重查 target 是 researcher"],
-              f"实际：{hooks_probe['自动重查 target 是 researcher']}")
-        check("自动重查的声明含被作废的原文", hooks_probe["自动重查 声明含被作废的原文"])
-        check("自动重查的声明含重查要求", hooks_probe["自动重查 声明含重查要求"])
-        check("手动重查作废了该类素材", hooks_probe["手动重查 作废了住宿"])
-        check("手动重查的声明进了续跑消息", hooks_probe["手动重查 声明进了续跑消息"])
-        check("手动重查仍交回 critic（不动 [9] 的 target 契约）",
-              hooks_probe["手动重查 仍交回 critic"])
+        chk("空输入后不再续跑", "空输入 条数", 1)
+        chk(f"最多问 {MAX_HANDOFFS} 次就收手（1 首次 + {MAX_HANDOFFS} 续跑）",
+            "封顶条数", MAX_HANDOFFS + 1)
+        chk("自动重查：作废后自动续跑一次", "自动重查 跑了几次", 2)
+        chk("自动重查不占用人的注意力", "自动重查 没问人")
+        chk("自动重查作废了该类素材", "自动重查 作废了住宿")
+        chk("自动重查用 HandoffMessage 续跑", "自动重查 用 HandoffMessage")
+        chk("自动重查指名 researcher", "自动重查 target 是 researcher")
+        chk("自动重查的声明含被作废的原文", "自动重查 声明含被作废的原文")
+        chk("自动重查的声明含重查要求", "自动重查 声明含重查要求")
+        chk("手动重查作废了该类素材", "手动重查 作废了住宿")
+        chk("手动重查的声明进了续跑消息", "手动重查 声明进了续跑消息")
+        chk("手动重查仍交回 critic（不动 [9] 的 target 契约）", "手动重查 仍交回 critic")
         # 证据是**加在**问题清单前面，不是替掉它——判据可能误判（researcher 重发整份
         # 清单就会撞上「重复搜索」），替掉的话用户就看不到要回答的那个问题了。
         _stalled = [t for t in hooks_probe["无进展提示"] if "无进展" in t]
@@ -1259,9 +1233,7 @@ def selftest() -> int:
         check("证据不替掉问题清单本身",
               bool(_stalled) and all("幻觉" in t for t in _stalled),
               f"实际：{_stalled}")
-        check("同一类第二次要求重查只自动作废一次",
-              hooks_probe["同类再重查 自动作废次数"] == 1,
-              f"实际：{hooks_probe['同类再重查 自动作废次数']}")
+        chk("同一类第二次要求重查只自动作废一次", "同类再重查 自动作废次数", 1)
         check("同一类第二次要求重查时升级给人",
               hooks_probe["同类再重查 问了人"]
               and any("自动重查过一次" in t for t in hooks_probe["同类再重查 提示"]),

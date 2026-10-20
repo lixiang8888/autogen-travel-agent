@@ -179,9 +179,7 @@ class _Session:
         self.answers: queue.Queue = queue.Queue()   # 浏览器 -> worker
         self.stop = ExternalTermination()           # 交给 main.py 挂在终止条件上
         self.stopped = threading.Event()            # worker 自己判断该不该收手
-        self.finished = threading.Event()
         self._question = ""
-        self._thread: threading.Thread | None = None
 
     # ---- 下面三个方法都在 worker 线程里被 main.py 调用 ----
 
@@ -234,17 +232,15 @@ class _Session:
     # ---- 生命周期 ----
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._worker, daemon=True)
-        self._thread.start()
+        threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self) -> None:
         try:
-            if self.demo:
-                asyncio.run(_demo_run(self.hooks))
-            else:
-                # replies 必须是 None 而不是 []——main.py 里 scripted 判的是
-                # `replies is not None`，传空列表会在第一次 handoff 就「预设用完」停下。
-                asyncio.run(stage5_full(self.task, None, hooks=self.hooks))
+            # replies 必须是 None 而不是 []——main.py 里 scripted 判的是
+            # `replies is not None`，传空列表会在第一次 handoff 就「预设用完」停下。
+            coro = (_demo_run(self.hooks) if self.demo
+                    else stage5_full(self.task, None, hooks=self.hooks))
+            asyncio.run(coro)
         except RuntimeError as exc:
             # 最常见的一种：没配 key（或 key 错了）。main.py 抛出的 RuntimeError 里
             # 带着一整段 traceback——终端里用 `=` 框起来还能读，塞进网页状态栏就是灾难。
@@ -253,7 +249,6 @@ class _Session:
         except Exception as exc:                        # noqa: BLE001
             self._fail("出错了", exc)
         finally:
-            self.finished.set()
             self.bus.publish({"type": "done"})
 
     def _fail(self, prefix: str, exc: BaseException) -> None:
@@ -383,13 +378,18 @@ class _Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return {}
 
-    def _json(self, payload: dict) -> None:
-        blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    def _send(self, body: bytes, content_type: str) -> None:
         self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(blob)
+        self.wfile.write(body)
+
+    def _json(self, payload: dict) -> None:
+        self._send(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
 
     # ---- 路由 ----
 
@@ -399,12 +399,10 @@ class _Handler(BaseHTTPRequestHandler):
             boot = json.dumps(
                 {"demo": self.server.demo, "defaultTask": DEFAULT_TASK}, ensure_ascii=False
             )
-            page = _PAGE.replace("__BOOT__", boot).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(page)))
-            self.end_headers()
-            self.wfile.write(page)
+            self._send(
+                _PAGE.replace("__BOOT__", boot).encode("utf-8"),
+                "text/html; charset=utf-8",
+            )
         elif path == "/health":
             # 只报身份，不碰 session——所以跑着一轮的时候它照样秒回，
             # 这正是「重复双击能不能认出自己人」需要的性质。
@@ -647,10 +645,7 @@ function handle(ev) {
     setAsking(true);
     setStatus("等你拍板", "warn");
   } else if (ev.type === "notice") {
-    if (ev.kind === "banner") { setStatus(ev.text, "warn"); }
-    else if (ev.kind === "warning") { setStatus(ev.text, "warn"); }
-    else if (ev.kind === "final") { setStatus(ev.text); }
-    else { setStatus(ev.text); }
+    setStatus(ev.text, (ev.kind === "banner" || ev.kind === "warning") ? "warn" : "");
   } else if (ev.type === "done") {
     setAsking(false);
     setRunning(false);
